@@ -13,7 +13,7 @@ class LeaderlessKVClusterTest {
     @Test
     void anyNodeCanCoordinateWritesToTheSameReplicaSet() {
         LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
-            "eval-cluster",
+            "test-cluster",
             new QuorumConfig(3, 2, 2)
         );
 
@@ -34,7 +34,7 @@ class LeaderlessKVClusterTest {
     @Test
     void anyNodeCanCoordinateReadsFromTheSameReplicaSet() {
         LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
-            "eval-cluster",
+            "test-cluster",
             new QuorumConfig(3, 2, 2)
         );
 
@@ -53,7 +53,7 @@ class LeaderlessKVClusterTest {
     @Test
     void replicaSelectionIsIndependentOfCoordinatorChoice() {
         LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
-            "eval-cluster",
+            "test-cluster",
             new QuorumConfig(5, 3, 3)
         );
 
@@ -68,7 +68,7 @@ class LeaderlessKVClusterTest {
     @Test
     void rejectsInvalidCoordinatorIndex() {
         LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
-            "eval-cluster",
+            "test-cluster",
             new QuorumConfig(3, 2, 2)
         );
 

@@ -17,7 +17,7 @@ class LeaderlessKVClusterTest {
 
     @Test
     void writeFailsWhenSuccessfulAcknowledgmentsStayBelowW() {
-        ClusterMembership membership = ClusterMembership.create("eval-cluster", 3, 3);
+        ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
         Map<String, VersionedKVStore> stores = storesFor(membership);
         stores.put(membership.getNodes().get(1).getId(), new UnavailableStore());
         LeaderlessKVCluster cluster = new LeaderlessKVCluster(
@@ -36,7 +36,7 @@ class LeaderlessKVClusterTest {
 
     @Test
     void readFailsWhenSuccessfulResponsesStayBelowR() {
-        ClusterMembership membership = ClusterMembership.create("eval-cluster", 3, 3);
+        ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
         Map<String, VersionedKVStore> stores = storesFor(membership);
         for (VersionedKVStore store : stores.values()) {
             store.set("trace:run-006", "score=0.84");

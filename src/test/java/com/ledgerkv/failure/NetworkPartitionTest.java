@@ -12,41 +12,41 @@ class NetworkPartitionTest {
     @Test
     void blocksCommunicationAcrossPartitionGroupsUntilHealed() {
         NetworkPartition partition = NetworkPartition.partitioned(List.of(
-            Set.of("eval-cluster-node-0", "eval-cluster-node-1"),
-            Set.of("eval-cluster-node-2")
+            Set.of("test-cluster-node-0", "test-cluster-node-1"),
+            Set.of("test-cluster-node-2")
         ));
 
-        assertTrue(partition.canCommunicate("eval-cluster-node-0", "eval-cluster-node-1"));
-        assertFalse(partition.canCommunicate("eval-cluster-node-0", "eval-cluster-node-2"));
-        assertFalse(partition.canCommunicate("eval-cluster-node-2", "eval-cluster-node-1"));
+        assertTrue(partition.canCommunicate("test-cluster-node-0", "test-cluster-node-1"));
+        assertFalse(partition.canCommunicate("test-cluster-node-0", "test-cluster-node-2"));
+        assertFalse(partition.canCommunicate("test-cluster-node-2", "test-cluster-node-1"));
 
         partition.heal();
 
-        assertTrue(partition.canCommunicate("eval-cluster-node-0", "eval-cluster-node-2"));
+        assertTrue(partition.canCommunicate("test-cluster-node-0", "test-cluster-node-2"));
         assertTrue(partition.snapshot().isHealed());
     }
 
     @Test
     void exposesPartitionGroupsForTestsAndMetrics() {
         NetworkPartition partition = NetworkPartition.partitioned(List.of(
-            Set.of("eval-cluster-node-0"),
-            Set.of("eval-cluster-node-1", "eval-cluster-node-2")
+            Set.of("test-cluster-node-0"),
+            Set.of("test-cluster-node-1", "test-cluster-node-2")
         ));
 
         NetworkPartitionSnapshot snapshot = partition.snapshot();
 
         assertTrue(snapshot.isActive());
         assertEquals(2, snapshot.getPartitionGroups().size());
-        assertEquals(0, snapshot.getGroupIndex("eval-cluster-node-0").orElseThrow());
-        assertEquals(1, snapshot.getGroupIndex("eval-cluster-node-2").orElseThrow());
+        assertEquals(0, snapshot.getGroupIndex("test-cluster-node-0").orElseThrow());
+        assertEquals(1, snapshot.getGroupIndex("test-cluster-node-2").orElseThrow());
         assertTrue(snapshot.getGroupIndex("unknown-node").isEmpty());
     }
 
     @Test
     void healingDoesNotMutateCapturedPartitionSnapshot() {
         NetworkPartition partition = NetworkPartition.partitioned(List.of(
-            Set.of("eval-cluster-node-0"),
-            Set.of("eval-cluster-node-1")
+            Set.of("test-cluster-node-0"),
+            Set.of("test-cluster-node-1")
         ));
         NetworkPartitionSnapshot beforeHeal = partition.snapshot();
 
@@ -55,7 +55,7 @@ class NetworkPartitionTest {
         assertTrue(beforeHeal.isActive());
         assertEquals(2, beforeHeal.getPartitionGroups().size());
         assertTrue(partition.snapshot().isHealed());
-        assertTrue(partition.canCommunicate("eval-cluster-node-0", "eval-cluster-node-1"));
+        assertTrue(partition.canCommunicate("test-cluster-node-0", "test-cluster-node-1"));
     }
 
     @Test

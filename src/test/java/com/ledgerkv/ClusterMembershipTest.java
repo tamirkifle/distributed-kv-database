@@ -12,21 +12,21 @@ class ClusterMembershipTest {
 
     @Test
     void createsClusterWithStableNodeIds() {
-        ClusterMembership membership = ClusterMembership.create("eval-cluster", 3, 2);
+        ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 2);
 
         List<ClusterNode> nodes = membership.getNodes();
 
         assertEquals(3, nodes.size());
-        assertEquals("eval-cluster-node-0", nodes.get(0).getId());
-        assertEquals("eval-cluster-node-1", nodes.get(1).getId());
-        assertEquals("eval-cluster-node-2", nodes.get(2).getId());
-        assertEquals(List.of("eval-cluster-node-0", "eval-cluster-node-1", "eval-cluster-node-2"),
+        assertEquals("test-cluster-node-0", nodes.get(0).getId());
+        assertEquals("test-cluster-node-1", nodes.get(1).getId());
+        assertEquals("test-cluster-node-2", nodes.get(2).getId());
+        assertEquals(List.of("test-cluster-node-0", "test-cluster-node-1", "test-cluster-node-2"),
             membership.getNodeIds());
     }
 
     @Test
     void selectsDeterministicReplicaSetForKey() {
-        ClusterMembership membership = ClusterMembership.create("eval-cluster", 5, 3);
+        ClusterMembership membership = ClusterMembership.create("test-cluster", 5, 3);
 
         List<ClusterNode> firstSelection = membership.selectReplicas("trace:run-001");
         List<ClusterNode> secondSelection = membership.selectReplicas("trace:run-001");

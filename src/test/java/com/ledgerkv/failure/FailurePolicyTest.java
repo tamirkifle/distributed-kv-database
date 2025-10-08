@@ -9,31 +9,31 @@ class FailurePolicyTest {
     @Test
     void tracksUnavailableNodesInObservableState() {
         FailurePolicy policy = FailurePolicy.builder(42L)
-            .unavailableNode("eval-cluster-node-1")
-            .unavailableNode("eval-cluster-node-2")
+            .unavailableNode("test-cluster-node-1")
+            .unavailableNode("test-cluster-node-2")
             .build();
 
-        assertTrue(policy.isNodeAvailable("eval-cluster-node-0"));
-        assertFalse(policy.isNodeAvailable("eval-cluster-node-1"));
-        assertFalse(policy.isNodeAvailable("eval-cluster-node-2"));
+        assertTrue(policy.isNodeAvailable("test-cluster-node-0"));
+        assertFalse(policy.isNodeAvailable("test-cluster-node-1"));
+        assertFalse(policy.isNodeAvailable("test-cluster-node-2"));
         assertEquals(
             2,
             policy.snapshot().getUnavailableNodeIds().size()
         );
-        assertTrue(policy.snapshot().getUnavailableNodeIds().contains("eval-cluster-node-1"));
+        assertTrue(policy.snapshot().getUnavailableNodeIds().contains("test-cluster-node-1"));
     }
 
     @Test
     void exposesFixedLatencyPerDestinationNode() {
         FailurePolicy policy = FailurePolicy.builder(7L)
-            .fixedLatency("eval-cluster-node-1", 25)
-            .fixedLatency("eval-cluster-node-2", 80)
+            .fixedLatency("test-cluster-node-1", 25)
+            .fixedLatency("test-cluster-node-2", 80)
             .build();
 
-        assertEquals(0, policy.latencyMsFor("eval-cluster-node-0"));
-        assertEquals(25, policy.latencyMsFor("eval-cluster-node-1"));
-        assertEquals(80, policy.latencyMsFor("eval-cluster-node-2"));
-        assertEquals(25, policy.snapshot().getFixedLatencyByNodeId().get("eval-cluster-node-1"));
+        assertEquals(0, policy.latencyMsFor("test-cluster-node-0"));
+        assertEquals(25, policy.latencyMsFor("test-cluster-node-1"));
+        assertEquals(80, policy.latencyMsFor("test-cluster-node-2"));
+        assertEquals(25, policy.snapshot().getFixedLatencyByNodeId().get("test-cluster-node-1"));
     }
 
     @Test
@@ -48,8 +48,8 @@ class FailurePolicyTest {
         for (int i = 0; i < 100; i++) {
             String messageId = "op-" + i;
             assertEquals(
-                first.shouldDropMessage(messageId, "eval-cluster-node-0", "eval-cluster-node-1"),
-                second.shouldDropMessage(messageId, "eval-cluster-node-0", "eval-cluster-node-1")
+                first.shouldDropMessage(messageId, "test-cluster-node-0", "test-cluster-node-1"),
+                second.shouldDropMessage(messageId, "test-cluster-node-0", "test-cluster-node-1")
             );
         }
     }

@@ -18,7 +18,7 @@ class FailureInjectionTest {
 
     @Test
     void failedWriteQuorumReportsRespondingAndFailedReplicaIds() {
-        ClusterMembership membership = ClusterMembership.create("eval-cluster", 3, 3);
+        ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
         Map<String, VersionedKVStore> stores = storesFor(membership);
         String failedNodeId = membership.getNodes().get(1).getId();
         stores.put(failedNodeId, new UnavailableStore());
@@ -41,7 +41,7 @@ class FailureInjectionTest {
 
     @Test
     void failedReadQuorumReportsRespondingAndFailedReplicaIds() {
-        ClusterMembership membership = ClusterMembership.create("eval-cluster", 3, 3);
+        ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
         Map<String, VersionedKVStore> stores = storesFor(membership);
         for (VersionedKVStore store : stores.values()) {
             store.set("trace:run-008", "score=0.89");

@@ -18,7 +18,7 @@ class HintedHandoffTest {
 
     @Test
     void successfulPartialWriteRecordsHintForUnavailableReplica() {
-        ClusterMembership membership = ClusterMembership.create("eval-cluster", 3, 3);
+        ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
         Map<String, VersionedKVStore> stores = storesFor(membership);
         String unavailableNodeId = membership.getNodes().get(1).getId();
         stores.put(unavailableNodeId, new ToggleableStore(false));
@@ -43,7 +43,7 @@ class HintedHandoffTest {
 
     @Test
     void replayKeepsFailedHintsPendingAndClearsAppliedHints() {
-        ClusterMembership membership = ClusterMembership.create("eval-cluster", 3, 3);
+        ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
         Map<String, VersionedKVStore> stores = storesFor(membership);
         String unavailableNodeId = membership.getNodes().get(1).getId();
         ToggleableStore recoveringStore = new ToggleableStore(false);

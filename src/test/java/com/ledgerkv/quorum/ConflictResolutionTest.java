@@ -19,7 +19,7 @@ class ConflictResolutionTest {
 
     @Test
     void readReturnsConflictingSiblingsForConcurrentReplicaValues() {
-        ClusterMembership membership = ClusterMembership.create("eval-cluster", 3, 3);
+        ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
         Map<String, VersionedKVStore> stores = storesFor(membership);
         String key = "trace:run-010";
         String node0 = membership.getNodes().get(0).getId();
@@ -47,7 +47,7 @@ class ConflictResolutionTest {
 
     @Test
     void readReturnsResolvedValueWhenOneVersionDominatesAllReplicas() {
-        ClusterMembership membership = ClusterMembership.create("eval-cluster", 3, 3);
+        ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
         Map<String, VersionedKVStore> stores = storesFor(membership);
         String key = "trace:run-011";
         String node0 = membership.getNodes().get(0).getId();
@@ -75,7 +75,7 @@ class ConflictResolutionTest {
     @Test
     void nonConflictingLeaderlessReadsKeepResolvedValueBehavior() {
         LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
-            "eval-cluster",
+            "test-cluster",
             new QuorumConfig(3, 2, 2)
         );
 
@@ -94,12 +94,12 @@ class ConflictResolutionTest {
         VersionedValue node0Value = new VersionedValue(
             "score=0.81",
             1,
-            VersionMetadata.initial("eval-cluster-node-0")
+            VersionMetadata.initial("test-cluster-node-0")
         );
         VersionedValue node1Value = new VersionedValue(
             "score=0.86",
             1,
-            VersionMetadata.initial("eval-cluster-node-1")
+            VersionMetadata.initial("test-cluster-node-1")
         );
 
         QuorumResponse firstOrder = new QuorumResponse(

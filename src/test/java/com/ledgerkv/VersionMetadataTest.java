@@ -10,8 +10,8 @@ class VersionMetadataTest {
 
     @Test
     void sequentialMetadataIsOrderedByVectorClock() {
-        VersionMetadata first = VersionMetadata.initial("eval-cluster-node-0");
-        VersionMetadata second = first.increment("eval-cluster-node-1");
+        VersionMetadata first = VersionMetadata.initial("test-cluster-node-0");
+        VersionMetadata second = first.increment("test-cluster-node-1");
 
         assertTrue(first.happensBefore(second));
         assertFalse(second.happensBefore(first));
@@ -20,8 +20,8 @@ class VersionMetadataTest {
 
     @Test
     void independentMetadataIsDetectedAsConcurrent() {
-        VersionMetadata node0Write = VersionMetadata.initial("eval-cluster-node-0");
-        VersionMetadata node1Write = VersionMetadata.initial("eval-cluster-node-1");
+        VersionMetadata node0Write = VersionMetadata.initial("test-cluster-node-0");
+        VersionMetadata node1Write = VersionMetadata.initial("test-cluster-node-1");
 
         assertTrue(node0Write.isConcurrentWith(node1Write));
         assertTrue(node1Write.isConcurrentWith(node0Write));
@@ -30,7 +30,7 @@ class VersionMetadataTest {
     @Test
     void leaderlessWritesAttachOrderedVersionMetadata() {
         LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
-            "eval-cluster",
+            "test-cluster",
             new QuorumConfig(3, 2, 2)
         );
 
@@ -41,7 +41,7 @@ class VersionMetadataTest {
         assertTrue(secondWrite.isSuccessful());
         assertTrue(firstWrite.getValue().getVersionMetadata()
             .happensBefore(secondWrite.getValue().getVersionMetadata()));
-        assertEquals(1, firstWrite.getValue().getVersionMetadata().getCounter("eval-cluster-node-0"));
-        assertEquals(1, secondWrite.getValue().getVersionMetadata().getCounter("eval-cluster-node-1"));
+        assertEquals(1, firstWrite.getValue().getVersionMetadata().getCounter("test-cluster-node-0"));
+        assertEquals(1, secondWrite.getValue().getVersionMetadata().getCounter("test-cluster-node-1"));
     }
 }
