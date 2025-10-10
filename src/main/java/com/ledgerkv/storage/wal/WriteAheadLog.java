@@ -88,21 +88,42 @@ public final class WriteAheadLog implements Closeable {
             long size = ch.size();
             long offset = 0;
             while (offset < size) {
+                long remaining = size - offset;
+
+                // A partial header at the tail is a torn write: truncate and stop.
+                if (remaining < HEADER_BYTES) {
+                    ch.truncate(offset);
+                    return;
+                }
+
                 ByteBuffer header = ByteBuffer.allocate(HEADER_BYTES);
                 readFully(ch, header, offset);
                 header.flip();
                 int len = header.getInt();
                 int crc = header.getInt();
 
+                // A garbage/partial length at the tail is a torn write.
+                if (len < 0 || len > MAX_RECORD_BYTES || remaining < HEADER_BYTES + (long) len) {
+                    ch.truncate(offset);
+                    return;
+                }
+
                 byte[] payload = new byte[len];
-                ByteBuffer pbuf = ByteBuffer.wrap(payload);
-                readFully(ch, pbuf, offset + HEADER_BYTES);
+                readFully(ch, ByteBuffer.wrap(payload), offset + HEADER_BYTES);
 
                 CRC32 c = new CRC32();
                 c.update(payload);
                 if ((int) c.getValue() != crc) {
-                    throw new WalCorruptionException("WAL CRC mismatch at offset " + offset);
+                    boolean moreFollows = offset + HEADER_BYTES + (long) len < size;
+                    if (moreFollows) {
+                        // A valid-looking record was written after this one, so this
+                        // cannot be a torn tail-write: the file is genuinely corrupt.
+                        throw new WalCorruptionException("WAL corruption at offset " + offset);
+                    }
+                    ch.truncate(offset); // torn CRC at the tail
+                    return;
                 }
+
                 consumer.accept(WalRecord.decode(payload));
                 offset += HEADER_BYTES + len;
             }
