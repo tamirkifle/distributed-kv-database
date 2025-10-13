@@ -71,6 +71,15 @@ public final class WriteAheadLog implements Closeable {
         }
     }
 
+    public void truncate() throws IOException {
+        synchronized (writeLock) {
+            channel.truncate(0);
+            channel.force(true);
+            writeOffset = 0;
+            syncedSeq = writeSeq; // everything before the checkpoint is now durable elsewhere
+        }
+    }
+
     @Override
     public void close() throws IOException {
         try {
