@@ -71,6 +71,14 @@ public final class WriteAheadLog implements Closeable {
         }
     }
 
+    public void sync() throws IOException {
+        long seq;
+        synchronized (writeLock) {
+            seq = writeSeq;
+        }
+        groupCommit(seq);
+    }
+
     public void truncate() throws IOException {
         synchronized (writeLock) {
             channel.truncate(0);
