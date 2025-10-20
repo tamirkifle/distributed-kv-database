@@ -1,0 +1,230 @@
+package com.ledgerkv.storage.lsm;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.nio.file.StandardOpenOption.READ;
+
+import com.ledgerkv.storage.bloom.BloomFilter;
+import java.io.Closeable;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.NoSuchElementException;
+import java.util.Optional;
+import java.util.zip.CRC32;
+
+/** An immutable, on-disk sorted run produced by {@link SSTableWriter}. */
+public final class SSTable implements Closeable {
+
+    static final int MAGIC = 0x4C534D31; // "LSM1"
+    static final int FOOTER_BYTES = 28;  // bloomOffset(8) + indexOffset(8) + entryCount(4) + magic(4) + crc(4)
+    static final int DEFAULT_BLOCK_SIZE = 4096;
+    static final double DEFAULT_FPP = 0.01;
+
+    private final FileChannel channel;
+    private final BloomFilter bloom;
+    private final int entryCount;
+    private final String[] firstKeys;
+    private final long[] blockOffsets;
+    private final int[] blockLengths;
+
+    private SSTable(FileChannel channel, BloomFilter bloom, int entryCount,
+                    String[] firstKeys, long[] blockOffsets, int[] blockLengths) {
+        this.channel = channel;
+        this.bloom = bloom;
+        this.entryCount = entryCount;
+        this.firstKeys = firstKeys;
+        this.blockOffsets = blockOffsets;
+        this.blockLengths = blockLengths;
+    }
+
+    public static SSTable open(Path path) throws IOException {
+        FileChannel channel = FileChannel.open(path, READ);
+        boolean ok = false;
+        try {
+            long size = channel.size();
+            if (size < FOOTER_BYTES) {
+                throw new SSTableCorruptionException("file too small to be an SSTable: " + path);
+            }
+            ByteBuffer footer = ByteBuffer.allocate(FOOTER_BYTES);
+            readFully(channel, footer, size - FOOTER_BYTES);
+            footer.flip();
+            long bloomOffset = footer.getLong();
+            long indexOffset = footer.getLong();
+            int entryCount = footer.getInt();
+            int magic = footer.getInt();
+            int crc = footer.getInt();
+            if (magic != MAGIC) {
+                throw new SSTableCorruptionException("bad SSTable magic in " + path);
+            }
+            CRC32 fcrc = new CRC32();
+            fcrc.update(footer.array(), 0, FOOTER_BYTES - 4);
+            if ((int) fcrc.getValue() != crc) {
+                throw new SSTableCorruptionException("footer CRC mismatch in " + path);
+            }
+
+            int bloomLen = (int) (indexOffset - bloomOffset);
+            ByteBuffer bloomBuf = ByteBuffer.allocate(bloomLen);
+            readFully(channel, bloomBuf, bloomOffset);
+            BloomFilter bloom = BloomFilter.deserialize(bloomBuf.array());
+
+            int indexLen = (int) ((size - FOOTER_BYTES) - indexOffset);
+            ByteBuffer indexBuf = ByteBuffer.allocate(indexLen);
+            readFully(channel, indexBuf, indexOffset);
+            indexBuf.flip();
+            int blockCount = indexBuf.getInt();
+            String[] firstKeys = new String[blockCount];
+            long[] blockOffsets = new long[blockCount];
+            int[] blockLengths = new int[blockCount];
+            for (int i = 0; i < blockCount; i++) {
+                int keyLen = indexBuf.getInt();
+                byte[] keyBytes = new byte[keyLen];
+                indexBuf.get(keyBytes);
+                firstKeys[i] = new String(keyBytes, UTF_8);
+                blockOffsets[i] = indexBuf.getLong();
+                blockLengths[i] = indexBuf.getInt();
+            }
+
+            SSTable table = new SSTable(channel, bloom, entryCount, firstKeys, blockOffsets, blockLengths);
+            ok = true;
+            return table;
+        } finally {
+            if (!ok) {
+                channel.close();
+            }
+        }
+    }
+
+    public Optional<Entry> get(String key) {
+        if (!bloom.mightContain(key)) {
+            return Optional.empty();
+        }
+        int blockIdx = findBlock(key);
+        if (blockIdx < 0) {
+            return Optional.empty();
+        }
+        for (Entry e : readBlock(blockIdx)) {
+            int cmp = e.key().compareTo(key);
+            if (cmp == 0) {
+                return Optional.of(e);
+            }
+            if (cmp > 0) {
+                break; // entries are sorted; we have passed where the key would be
+            }
+        }
+        return Optional.empty();
+    }
+
+    public Iterator<Entry> iterator() {
+        return new Iterator<Entry>() {
+            private int blockIdx = 0;
+            private Iterator<Entry> current = Collections.emptyIterator();
+
+            @Override
+            public boolean hasNext() {
+                while (!current.hasNext() && blockIdx < blockOffsets.length) {
+                    current = readBlock(blockIdx++).iterator();
+                }
+                return current.hasNext();
+            }
+
+            @Override
+            public Entry next() {
+                if (!hasNext()) {
+                    throw new NoSuchElementException();
+                }
+                return current.next();
+            }
+        };
+    }
+
+    public int entryCount() {
+        return entryCount;
+    }
+
+    int blockCount() {
+        return firstKeys.length;
+    }
+
+    /** Index of the block that may contain {@code key}: the last block whose firstKey <= key. */
+    private int findBlock(String key) {
+        int lo = 0;
+        int hi = firstKeys.length - 1;
+        int result = -1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            if (firstKeys[mid].compareTo(key) <= 0) {
+                result = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return result;
+    }
+
+    private List<Entry> readBlock(int blockIdx) {
+        try {
+            int length = blockLengths[blockIdx];
+            ByteBuffer buf = ByteBuffer.allocate(length);
+            readFully(channel, buf, blockOffsets[blockIdx]);
+            buf.flip();
+            byte[] payload = new byte[length - 4];
+            buf.get(payload);
+            int storedCrc = buf.getInt();
+            CRC32 crc = new CRC32();
+            crc.update(payload);
+            if ((int) crc.getValue() != storedCrc) {
+                throw new SSTableCorruptionException(
+                        "data block CRC mismatch at offset " + blockOffsets[blockIdx]);
+            }
+            return decodeEntries(payload);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    private static List<Entry> decodeEntries(byte[] payload) {
+        List<Entry> entries = new ArrayList<>();
+        ByteBuffer buf = ByteBuffer.wrap(payload);
+        while (buf.hasRemaining()) {
+            int keyLen = buf.getInt();
+            byte[] keyBytes = new byte[keyLen];
+            buf.get(keyBytes);
+            String key = new String(keyBytes, UTF_8);
+            int valLen = buf.getInt();
+            if (valLen < 0) { // tombstone: no value bytes
+                long seq = buf.getLong();
+                entries.add(Entry.tombstone(key, seq));
+            } else {
+                byte[] val = new byte[valLen];
+                buf.get(val);
+                long seq = buf.getLong();
+                entries.add(Entry.put(key, val, seq));
+            }
+        }
+        return entries;
+    }
+
+    private static void readFully(FileChannel ch, ByteBuffer buf, long pos) throws IOException {
+        long p = pos;
+        while (buf.hasRemaining()) {
+            int n = ch.read(buf, p);
+            if (n < 0) {
+                throw new EOFException("unexpected EOF reading SSTable at " + p);
+            }
+            p += n;
+        }
+    }
+
+    @Override
+    public void close() throws IOException {
+        channel.close();
+    }
+}
