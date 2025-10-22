@@ -168,6 +168,15 @@ public final class SSTableWriter implements Closeable {
         return ByteBuffer.allocate(4).putInt(v).array();
     }
 
+    /**
+     * Approximate bytes written so far: flushed file offset plus the entries buffered in the
+     * current (not-yet-flushed) data block. Used by the compactor to roll over to a new output
+     * file once it grows past a target size.
+     */
+    public long approximateSizeBytes() {
+        return fileOffset + blockBuf.size();
+    }
+
     @Override
     public void close() throws IOException {
         try {

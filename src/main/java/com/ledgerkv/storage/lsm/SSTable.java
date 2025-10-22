@@ -148,6 +148,20 @@ public final class SSTable implements Closeable {
         return entryCount;
     }
 
+    /** The smallest key in this table, or {@code null} if the table is empty. */
+    public String firstKey() {
+        return firstKeys.length == 0 ? null : firstKeys[0];
+    }
+
+    /** The largest key in this table, or {@code null} if empty. */
+    public String lastKey() {
+        if (firstKeys.length == 0) {
+            return null;
+        }
+        List<Entry> last = readBlock(firstKeys.length - 1);
+        return last.get(last.size() - 1).key();
+    }
+
     int blockCount() {
         return firstKeys.length;
     }
