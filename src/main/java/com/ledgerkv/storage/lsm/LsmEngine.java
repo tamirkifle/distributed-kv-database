@@ -78,7 +78,7 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
                 throw new UncheckedIOException(e);
             }
             active.put(key, value, ++sequence);
-            // flush-on-threshold is added in Task 2.
+            maybeFlush();
         }
     }
 
@@ -93,8 +93,68 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
                 throw new UncheckedIOException(e);
             }
             active.delete(key, ++sequence);
-            // flush-on-threshold is added in Task 2.
+            maybeFlush();
         }
+    }
+
+    /** Flushes the active MemTable once it crosses the configured byte threshold. Caller holds writeLock. */
+    private void maybeFlush() {
+        if (active.approximateSizeBytes() >= config.memtableFlushBytes) {
+            flushLocked();
+        }
+    }
+
+    /** Forces a flush of the active MemTable (package-private test seam). */
+    void flush() {
+        synchronized (writeLock) {
+            flushLocked();
+        }
+    }
+
+    /** Number of live SSTables (package-private test seam). */
+    int sstableCount() {
+        return sstables.size();
+    }
+
+    /**
+     * Seals the active MemTable, writes it to a new SSTable, swaps the SSTable in (copy-on-write),
+     * then truncates the WAL. Caller holds writeLock, so no concurrent write can append to the WAL
+     * between seal and truncate. Reads never block: they see the sealed table via {@code flushing}
+     * until its SSTable is durable.
+     */
+    private void flushLocked() {
+        MemTable sealed = active;
+        if (sealed.isEmpty()) {
+            return;
+        }
+        sealed.seal();
+        flushing = sealed;          // readers can still find these keys
+        active = new MemTable();
+        try {
+            List<Entry> entries = new ArrayList<>(sealed.entries());
+            Path path = directory.resolve(sstFileName(nextSstableId.getAndIncrement()));
+            try (SSTableWriter writer = new SSTableWriter(path, entries.size())) {
+                for (Entry e : entries) {
+                    writer.add(e);
+                }
+                writer.finish();
+            }
+            SSTableHandle handle = SSTableHandle.open(path, 0);
+            synchronized (sstablesLock) {
+                List<SSTableHandle> next = new ArrayList<>(sstables);
+                next.add(handle);
+                sstables = Collections.unmodifiableList(next);
+            }
+            flushing = null;        // now durable in the SSTable
+            wal.truncate();         // all sealed data is in the SSTable; the WAL may be reset
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** SSTable filename, matching the format the Compactor uses so ids never collide. */
+    private static String sstFileName(long id) {
+        return String.format("sst-%010d.db", id);
     }
 
     @Override
