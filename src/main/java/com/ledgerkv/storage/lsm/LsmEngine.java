@@ -53,7 +53,12 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
         this.directory = directory;
         this.config = config;
         Files.createDirectories(directory);
-        // Recovery (load SSTables + replay WAL) is added in Task 3.
+
+        long maxId = loadExistingSstables();        // opens handles into `sstables`
+        nextSstableId.set(maxId + 1);
+        this.sequence = maxSequenceInSstables();     // high-water so WAL entries outrank SSTables
+        WriteAheadLog.replay(walPath(directory), this::replayRecord);
+
         this.wal = new WriteAheadLog(walPath(directory), config.durability);
         // Background compactor is wired in Task 5.
     }
@@ -232,5 +237,55 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
 
     private static Path walPath(Path dir) {
         return dir.resolve("wal.log");
+    }
+
+    /** Opens every {@code sst-*.db} file in the directory at level 0; returns the max file id (or -1). */
+    private long loadExistingSstables() throws IOException {
+        List<SSTableHandle> loaded = new ArrayList<>();
+        long maxId = -1L;
+        List<Path> files = new ArrayList<>();
+        try (java.nio.file.DirectoryStream<Path> ds =
+                     Files.newDirectoryStream(directory, "sst-*.db")) {
+            for (Path p : ds) {
+                files.add(p);
+            }
+        }
+        files.sort(java.util.Comparator.comparing(p -> p.getFileName().toString()));
+        for (Path p : files) {
+            loaded.add(SSTableHandle.open(p, 0));
+            maxId = Math.max(maxId, parseSstableId(p));
+        }
+        sstables = Collections.unmodifiableList(loaded);
+        return maxId;
+    }
+
+    /** Highest entry sequence across all loaded SSTables (0 if none). Documented O(entries) scan. */
+    private long maxSequenceInSstables() {
+        long max = 0L;
+        for (SSTableHandle h : sstables) {
+            java.util.Iterator<Entry> it = h.table().iterator();
+            while (it.hasNext()) {
+                long s = it.next().sequence();
+                if (s > max) {
+                    max = s;
+                }
+            }
+        }
+        return max;
+    }
+
+    /** Applies one replayed WAL record to the active MemTable with a fresh (newer) sequence. */
+    private void replayRecord(WalRecord record) {
+        if (record.value() == null) {          // null value marks a DELETE
+            active.delete(record.key(), ++sequence);
+        } else {
+            active.put(record.key(), record.value(), ++sequence);
+        }
+    }
+
+    /** Parses the 10-digit id from {@code sst-0000000007.db}. */
+    private static long parseSstableId(Path p) {
+        String name = p.getFileName().toString();   // sst-##########.db
+        return Long.parseLong(name.substring(4, name.length() - 3));
     }
 }
