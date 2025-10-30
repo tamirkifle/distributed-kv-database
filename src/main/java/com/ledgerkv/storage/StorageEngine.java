@@ -1,6 +1,8 @@
 package com.ledgerkv.storage;
 
+import com.ledgerkv.storage.lsm.Entry;
 import java.io.Closeable;
+import java.util.Iterator;
 import java.util.Optional;
 
 /**
@@ -21,5 +23,9 @@ public interface StorageEngine extends Closeable {
     /** Removes {@code key} by writing a tombstone. */
     void delete(String key);
 
-    // scan(...) is added in Task 4.
+    /**
+     * An ordered iterator over the live entries with {@code fromInclusive <= key < toExclusive}.
+     * A {@code null} bound is open-ended. Tombstoned keys are omitted.
+     */
+    Iterator<Entry> scan(String fromInclusive, String toExclusive);
 }

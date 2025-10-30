@@ -12,7 +12,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
@@ -180,6 +182,24 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
         return Optional.of(best.value());
     }
 
+    @Override
+    public Iterator<Entry> scan(String fromInclusive, String toExclusive) {
+        ensureOpen();
+        List<Iterator<Entry>> runs = new ArrayList<>();
+        runs.add(active.entries().iterator());
+        MemTable f = flushing;
+        if (f != null) {
+            runs.add(f.entries().iterator());
+        }
+        for (SSTableHandle h : sstables) {
+            runs.add(h.table().iterator());
+        }
+        // dropTombstones=true: the merge resolves newest-wins, so a winning tombstone means the
+        // key is deleted and is correctly omitted from the live scan view.
+        MergeIterator merged = new MergeIterator(runs, true);
+        return new BoundedIterator(merged, fromInclusive, toExclusive);
+    }
+
     /** The higher-sequence of two candidates (either may be null). */
     private static Entry newer(Entry candidate, Entry current) {
         if (candidate == null) {
@@ -287,5 +307,53 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
     private static long parseSstableId(Path p) {
         String name = p.getFileName().toString();   // sst-##########.db
         return Long.parseLong(name.substring(4, name.length() - 3));
+    }
+
+    /**
+     * Yields the ascending entries of {@code source} whose key is in {@code [from, to)}. Because the
+     * source is ascending, it terminates at the first key &gt;= {@code to}. {@code null} bounds are open.
+     */
+    private static final class BoundedIterator implements Iterator<Entry> {
+        private final Iterator<Entry> source;
+        private final String from;
+        private final String to;
+        private Entry next;
+
+        BoundedIterator(Iterator<Entry> source, String from, String to) {
+            this.source = source;
+            this.from = from;
+            this.to = to;
+            advance();
+        }
+
+        private void advance() {
+            next = null;
+            while (source.hasNext()) {
+                Entry e = source.next();
+                if (from != null && e.key().compareTo(from) < 0) {
+                    continue;                       // below the lower bound; keep scanning
+                }
+                if (to != null && e.key().compareTo(to) >= 0) {
+                    return;                         // reached the upper bound; ascending ⇒ done
+                }
+                next = e;
+                return;
+            }
+        }
+
+        @Override
+        public boolean hasNext() {
+            return next != null;
+        }
+
+        @Override
+        public Entry next() {
+            if (next == null) {
+                throw new NoSuchElementException();
+            }
+            Entry result = next;
+            advance();
+            return result;
+        }
     }
 }
