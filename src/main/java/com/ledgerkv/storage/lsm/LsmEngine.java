@@ -62,7 +62,11 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
         WriteAheadLog.replay(walPath(directory), this::replayRecord);
 
         this.wal = new WriteAheadLog(walPath(directory), config.durability);
-        // Background compactor is wired in Task 5.
+        if (config.strategy != null) {
+            this.compactor = new Compactor(config.strategy, this, directory,
+                    config.maxSstableBytes, nextSstableId, config.compactionPollMillis);
+            this.compactor.start();
+        }
     }
 
     public static LsmEngine open(Path directory) throws IOException {
@@ -121,6 +125,11 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
     /** Number of live SSTables (package-private test seam). */
     int sstableCount() {
         return sstables.size();
+    }
+
+    /** The background compactor's last error, or null (package-private test seam). */
+    IOException compactionError() {
+        return compactor == null ? null : compactor.lastError();
     }
 
     /**
