@@ -2,7 +2,6 @@ package com.ledgerkv.quorum;
 
 import com.ledgerkv.QuorumConfig;
 import com.ledgerkv.QuorumResponse;
-import com.ledgerkv.VersionedKVStore;
 import com.ledgerkv.VersionedValue;
 import com.ledgerkv.failure.FailureCause;
 import com.ledgerkv.failure.FailureContext;
@@ -16,57 +15,43 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
+/**
+ * Leaderless quorum coordinator. Any node can coordinate a read or write against the key's replica
+ * set; the N/R/W math, read-repair, hinted-handoff, and conflict resolution all run over the
+ * transport-agnostic {@link ReplicaClient} seam — the replicas may be same-JVM {@code LsmEngine}s
+ * ({@link LocalReplicaClient}) or remote gRPC nodes ({@link GrpcReplicaClient}).
+ *
+ * <p>The coordinator owns versioning: each write assigns one {@link VersionMetadata} vector clock
+ * (incremented for the coordinator) plus a derived {@code long} version, and pushes the identical
+ * {@link VersionedValue} to every replica verbatim.
+ */
 public final class LeaderlessKVCluster {
     private final ClusterMembership membership;
     private final QuorumConfig config;
-    private final Map<String, VersionedKVStore> storesByNodeId;
+    private final Map<String, ReplicaClient> clientsByNodeId;
     private final Map<String, VersionMetadata> versionMetadataByKey;
     private final List<HintedHandoff> pendingHints;
 
-    private LeaderlessKVCluster(ClusterMembership membership, QuorumConfig config) {
-        this.membership = membership;
-        this.config = config;
-        this.storesByNodeId = new LinkedHashMap<>();
-        this.versionMetadataByKey = new LinkedHashMap<>();
-        this.pendingHints = new ArrayList<>();
-        for (ClusterNode node : membership.getNodes()) {
-            storesByNodeId.put(node.getId(), new VersionedKVStore());
-        }
-    }
-
     LeaderlessKVCluster(ClusterMembership membership, QuorumConfig config,
-                        Map<String, VersionedKVStore> storesByNodeId) {
+                        Map<String, ReplicaClient> clientsByNodeId) {
         this.membership = Objects.requireNonNull(membership, "membership must not be null");
         this.config = Objects.requireNonNull(config, "quorum config must not be null");
-        this.storesByNodeId = new LinkedHashMap<>();
+        this.clientsByNodeId = new LinkedHashMap<>();
         this.versionMetadataByKey = new LinkedHashMap<>();
         this.pendingHints = new ArrayList<>();
         for (ClusterNode node : membership.getNodes()) {
-            VersionedKVStore store = storesByNodeId.get(node.getId());
-            if (store == null) {
-                throw new IllegalArgumentException("store missing for node " + node.getId());
+            ReplicaClient client = clientsByNodeId.get(node.getId());
+            if (client == null) {
+                throw new IllegalArgumentException("replica client missing for node " + node.getId());
             }
-            this.storesByNodeId.put(node.getId(), store);
+            this.clientsByNodeId.put(node.getId(), client);
         }
-    }
-
-    public static LeaderlessKVCluster create(String clusterId, QuorumConfig config) {
-        if (config == null) {
-            throw new IllegalArgumentException("quorum config must not be null");
-        }
-
-        ClusterMembership membership = ClusterMembership.create(
-            clusterId,
-            config.getN(),
-            config.getN()
-        );
-        return new LeaderlessKVCluster(membership, config);
     }
 
     public static LeaderlessKVCluster create(ClusterMembership membership,
                                              QuorumConfig config,
-                                             Map<String, VersionedKVStore> storesByNodeId) {
-        return new LeaderlessKVCluster(membership, config, storesByNodeId);
+                                             Map<String, ReplicaClient> clientsByNodeId) {
+        return new LeaderlessKVCluster(membership, config, clientsByNodeId);
     }
 
     public ClusterMembership getMembership() {
@@ -74,15 +59,15 @@ public final class LeaderlessKVCluster {
     }
 
     public List<ClusterNode> selectReplicas(String key) {
-        return membership.selectReplicas(key);
+        return membership.getPreferenceList(key, membership.getReplicationFactor());
     }
 
     public Optional<VersionedValue> getReplicaValue(String nodeId, String key) {
-        VersionedKVStore store = storesByNodeId.get(nodeId);
-        if (store == null) {
+        ReplicaClient client = clientsByNodeId.get(nodeId);
+        if (client == null) {
             return Optional.empty();
         }
-        return store.get(key);
+        return client.get(key);
     }
 
     public List<HintedHandoff> getPendingHints() {
@@ -95,16 +80,15 @@ public final class LeaderlessKVCluster {
 
         long startTime = System.currentTimeMillis();
         int acknowledgments = 0;
-        long maxVersion = 0;
         FailureContext.Builder failureContext = FailureContext.builder();
         VersionMetadata nextMetadata = nextVersionMetadata(key, coordinatorIndex);
+        VersionedValue versionedValue = new VersionedValue(value, versionFor(nextMetadata), nextMetadata);
         List<String> failedReplicaIds = new ArrayList<>();
 
         for (ClusterNode replica : selectReplicas(key)) {
             try {
-                long version = storesByNodeId.get(replica.getId()).set(key, value, nextMetadata);
+                clientsByNodeId.get(replica.getId()).put(key, versionedValue);
                 acknowledgments++;
-                maxVersion = Math.max(maxVersion, version);
                 failureContext.responded(replica.getId());
             } catch (RuntimeException ignored) {
                 // Failed replicas do not count toward the write quorum.
@@ -118,7 +102,7 @@ public final class LeaderlessKVCluster {
             versionMetadataByKey.put(key, nextMetadata);
             recordHints(coordinatorIndex, key, value, nextMetadata, failedReplicaIds);
         }
-        VersionedValue responseValue = successful ? new VersionedValue(value, maxVersion, nextMetadata) : null;
+        VersionedValue responseValue = successful ? versionedValue : null;
         return new QuorumResponse(successful, responseValue, List.of(), acknowledgments,
             config.getW(), System.currentTimeMillis() - startTime, failureContext.build());
     }
@@ -129,14 +113,16 @@ public final class LeaderlessKVCluster {
         List<HintedHandoff> remainingHints = new ArrayList<>();
 
         for (HintedHandoff hint : pendingHints) {
-            VersionedKVStore store = storesByNodeId.get(hint.getTargetNodeId());
-            if (store == null) {
+            ReplicaClient client = clientsByNodeId.get(hint.getTargetNodeId());
+            if (client == null) {
                 remainingHints.add(hint);
                 continue;
             }
 
             try {
-                store.set(hint.getKey(), hint.getValue(), hint.getVersionMetadata());
+                VersionMetadata hintMetadata = hint.getVersionMetadata();
+                client.deliverHint(hint.getKey(),
+                    new VersionedValue(hint.getValue(), versionFor(hintMetadata), hintMetadata));
                 appliedCount++;
             } catch (RuntimeException ignored) {
                 remainingHints.add(hint);
@@ -157,7 +143,7 @@ public final class LeaderlessKVCluster {
 
         for (ClusterNode replica : selectReplicas(key)) {
             try {
-                values.add(storesByNodeId.get(replica.getId()).get(key).orElse(null));
+                values.add(clientsByNodeId.get(replica.getId()).get(key).orElse(null));
                 failureContext.responded(replica.getId());
             } catch (RuntimeException ignored) {
                 // Failed replicas do not count toward the read quorum.
@@ -191,7 +177,7 @@ public final class LeaderlessKVCluster {
 
         for (ClusterNode replica : selectReplicas(key)) {
             try {
-                VersionedValue value = storesByNodeId.get(replica.getId()).get(key).orElse(null);
+                VersionedValue value = clientsByNodeId.get(replica.getId()).get(key).orElse(null);
                 values.add(value);
                 failureContext.responded(replica.getId());
             } catch (RuntimeException ignored) {
@@ -207,11 +193,11 @@ public final class LeaderlessKVCluster {
         if (latest != null) {
             for (ClusterNode replica : selectReplicas(key)) {
                 try {
-                    Optional<VersionedValue> current = storesByNodeId.get(replica.getId()).get(key);
+                    Optional<VersionedValue> current = clientsByNodeId.get(replica.getId()).get(key);
                     if (current.map(value -> sameStoredValue(value, latest)).orElse(false)) {
                         continue;
                     }
-                    storesByNodeId.get(replica.getId()).set(key, latest.getValue(), latest.getVersionMetadata());
+                    clientsByNodeId.get(replica.getId()).put(key, latest);
                 } catch (RuntimeException ignored) {
                     failureContext.failed(replica.getId(), FailureCause.UNAVAILABLE_NODE);
                 }
@@ -237,6 +223,19 @@ public final class LeaderlessKVCluster {
             return VersionMetadata.initial(coordinatorNodeId);
         }
         return current.increment(coordinatorNodeId);
+    }
+
+    /**
+     * Derives the {@code long} version from the vector clock (sum of per-node counters): monotonic
+     * along a causal chain, equal for concurrent writes. Reads use it only to pick a proposed latest;
+     * conflict detection keys off the clock itself.
+     */
+    private static long versionFor(VersionMetadata metadata) {
+        long sum = 0;
+        for (long counter : metadata.getVectorClock().values()) {
+            sum += counter;
+        }
+        return sum;
     }
 
     private void recordHints(int coordinatorIndex, String key, String value,

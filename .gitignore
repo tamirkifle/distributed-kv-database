@@ -5,6 +5,7 @@
 *.ear
 target/
 build/
+dependency-reduced-pom.xml
 
 # IDE
 .idea/

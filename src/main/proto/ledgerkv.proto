@@ -1,0 +1,147 @@
+syntax = "proto3";
+
+option java_package = "com.ledgerkv.transport.proto";
+option java_multiple_files = true;
+
+package ledgerkv;
+
+// The node-facing gRPC surface. Carries both client-facing operations
+// (Get/Put/Delete/Scan) and the internal replica/anti-entropy RPCs that
+// the quorum layer wires up in 2c. The storage delegate behind this
+// service is a temporary in-memory map in 2a, replaced by the LSM engine
+// in 2b.
+service LedgerKvNode {
+  // Client-facing operations.
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Scan(ScanRequest) returns (stream ScanEntry);
+
+  // Internal replica RPCs (used by the quorum layer in 2c).
+  rpc ReplicaGet(ReplicaGetRequest) returns (ReplicaGetResponse);
+  rpc ReplicaPut(ReplicaPutRequest) returns (ReplicaPutResponse);
+  rpc DeliverHint(HintRequest) returns (HintResponse);
+}
+
+// Version metadata carried alongside a value (mirrors VersionMetadata's
+// vector clock: node id -> per-node counter). Reconciled in 2c so the wire
+// carries the full causal clock, not just a timestamp.
+message VersionMetadataPb {
+  map<string, int64> vector_clock = 1;
+}
+
+// A versioned value as it travels on the wire. Full population happens in
+// 2b/2c; the schema is fixed now so the replica RPCs have a stable shape.
+message VersionedValuePb {
+  bytes value = 1;
+  int64 version = 2;
+  bool tombstone = 3;
+  VersionMetadataPb metadata = 4;
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  bool found = 1;
+  VersionedValuePb value = 2;
+}
+
+message PutRequest {
+  string key = 1;
+  bytes value = 2;
+}
+
+message PutResponse {
+  int64 version = 1;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  bool existed = 1;
+}
+
+message ScanRequest {
+  string start_key = 1;
+  string end_key = 2;
+  int32 limit = 3;
+}
+
+message ScanEntry {
+  string key = 1;
+  VersionedValuePb value = 2;
+}
+
+message ReplicaGetRequest {
+  string key = 1;
+}
+
+message ReplicaGetResponse {
+  bool found = 1;
+  VersionedValuePb value = 2;
+}
+
+message ReplicaPutRequest {
+  string key = 1;
+  VersionedValuePb value = 2;
+}
+
+message ReplicaPutResponse {
+  bool ok = 1;
+}
+
+message HintRequest {
+  string target_node = 1;
+  string key = 2;
+  VersionedValuePb value = 3;
+}
+
+message HintResponse {
+  bool accepted = 1;
+}
+
+// ── Raft consensus surface (Phase 3b) ──────────────────────────────────────
+// A SEPARATE service from LedgerKvNode so the CP Raft path and the AP Dynamo
+// path never share a message schema or a stub.
+service LedgerKvRaft {
+  rpc RequestVote   (RequestVoteRequest)   returns (RequestVoteResponse);
+  rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
+}
+
+message RaftLogEntry {
+  int64 term = 1;
+  int64 index = 2;
+  bytes command = 3;
+}
+
+message RequestVoteRequest {
+  int64 term = 1;
+  string candidate_id = 2;
+  int64 last_log_index = 3;
+  int64 last_log_term = 4;
+}
+
+message RequestVoteResponse {
+  int64 term = 1;
+  bool vote_granted = 2;
+}
+
+message AppendEntriesRequest {
+  int64 term = 1;
+  string leader_id = 2;
+  int64 prev_log_index = 3;
+  int64 prev_log_term = 4;
+  repeated RaftLogEntry entries = 5;
+  int64 leader_commit = 6;
+}
+
+message AppendEntriesResponse {
+  int64 term = 1;
+  bool success = 2;
+  int64 match_index = 3;
+  int64 conflict_index = 4;
+}

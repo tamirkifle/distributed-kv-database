@@ -1,0 +1,89 @@
+# A 5-node LedgerKV cluster. N=3 replication, W=R=2 -> tolerates any single node loss.
+# Every node is a quorum coordinator: a client may hit any node's public gRPC API.
+
+x-node-env: &node-env
+  LEDGERKV_CLUSTER_ID: ledgerkv
+  LEDGERKV_NODE_COUNT: "5"
+  LEDGERKV_GRPC_PORT: "9090"
+  LEDGERKV_HEALTH_PORT: "8080"
+  LEDGERKV_DATA_DIR: /data
+  LEDGERKV_REPLICATION_FACTOR: "3"
+  LEDGERKV_WRITE_QUORUM: "2"
+  LEDGERKV_READ_QUORUM: "2"
+  LEDGERKV_PEERS: node0:9090,node1:9090,node2:9090,node3:9090,node4:9090
+
+x-node-healthcheck: &node-healthcheck
+  test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+  interval: 5s
+  timeout: 3s
+  retries: 5
+  start_period: 20s
+
+services:
+  node0:
+    build: .
+    image: ledgerkv:dev
+    environment:
+      <<: *node-env
+      LEDGERKV_NODE_INDEX: "0"
+    ports:
+      - "9090:9090"
+      - "8080:8080"
+    volumes:
+      - node0-data:/data
+    healthcheck: *node-healthcheck
+
+  node1:
+    image: ledgerkv:dev
+    environment:
+      <<: *node-env
+      LEDGERKV_NODE_INDEX: "1"
+    ports:
+      - "9091:9090"
+      - "8081:8080"
+    volumes:
+      - node1-data:/data
+    healthcheck: *node-healthcheck
+
+  node2:
+    image: ledgerkv:dev
+    environment:
+      <<: *node-env
+      LEDGERKV_NODE_INDEX: "2"
+    ports:
+      - "9092:9090"
+      - "8082:8080"
+    volumes:
+      - node2-data:/data
+    healthcheck: *node-healthcheck
+
+  node3:
+    image: ledgerkv:dev
+    environment:
+      <<: *node-env
+      LEDGERKV_NODE_INDEX: "3"
+    ports:
+      - "9093:9090"
+      - "8083:8080"
+    volumes:
+      - node3-data:/data
+    healthcheck: *node-healthcheck
+
+  node4:
+    image: ledgerkv:dev
+    environment:
+      <<: *node-env
+      LEDGERKV_NODE_INDEX: "4"
+    ports:
+      - "9094:9090"
+      - "8084:8080"
+    volumes:
+      - node4-data:/data
+    healthcheck: *node-healthcheck
+
+volumes:
+  node0-data:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:

@@ -2,18 +2,29 @@ package com.ledgerkv.quorum;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 public final class ClusterMembership {
     private final String clusterId;
     private final List<ClusterNode> nodes;
     private final int replicationFactor;
+    private final HashRing ring;
+    private final Map<String, ClusterNode> nodesById;
 
     private ClusterMembership(String clusterId, List<ClusterNode> nodes, int replicationFactor) {
         this.clusterId = clusterId;
         this.nodes = Collections.unmodifiableList(new ArrayList<>(nodes));
         this.replicationFactor = replicationFactor;
+        this.nodesById = new LinkedHashMap<>();
+        HashRing builtRing = new HashRing();
+        for (ClusterNode node : this.nodes) {
+            this.nodesById.put(node.getId(), node);
+            builtRing.addNode(node.getId());
+        }
+        this.ring = builtRing;
     }
 
     public static ClusterMembership create(String clusterId, int nodeCount, int replicationFactor) {
@@ -45,15 +56,10 @@ public final class ClusterMembership {
         return replicationFactor;
     }
 
-    public List<ClusterNode> selectReplicas(String key) {
-        if (key == null || key.trim().isEmpty()) {
-            throw new IllegalArgumentException("key must not be blank");
-        }
-
-        int startIndex = Math.floorMod(key.hashCode(), nodes.size());
+    public List<ClusterNode> getPreferenceList(String key, int n) {
         List<ClusterNode> replicas = new ArrayList<>();
-        for (int i = 0; i < replicationFactor; i++) {
-            replicas.add(nodes.get((startIndex + i) % nodes.size()));
+        for (String nodeId : ring.getPreferenceList(key, n)) {
+            replicas.add(nodesById.get(nodeId));
         }
         return Collections.unmodifiableList(replicas);
     }

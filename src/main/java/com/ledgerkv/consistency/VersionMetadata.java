@@ -21,6 +21,15 @@ public final class VersionMetadata {
         return new VersionMetadata(clock);
     }
 
+    /**
+     * Reconstructs metadata from a previously-extracted vector clock (e.g. after deserialization).
+     * Copies the map defensively; the result is immutable.
+     */
+    public static VersionMetadata of(Map<String, Long> vectorClock) {
+        Objects.requireNonNull(vectorClock, "vectorClock must not be null");
+        return new VersionMetadata(vectorClock);
+    }
+
     public static VersionMetadata legacy(long version) {
         if (version < 0) {
             throw new IllegalArgumentException("version must be >= 0");
