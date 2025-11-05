@@ -2,6 +2,7 @@ package com.ledgerkv.storage;
 
 import com.ledgerkv.storage.lsm.Entry;
 import java.io.Closeable;
+import java.util.Iterator;
 import java.util.Optional;
 
 /**
@@ -24,9 +25,7 @@ public interface StorageEngine extends Closeable {
 
     /**
      * An ordered iterator over the live entries with {@code fromInclusive <= key < toExclusive}.
-     * A {@code null} bound is open-ended. Tombstoned keys are omitted. The returned iterator pins
-     * the SSTables it reads; callers that do not drain it fully MUST {@link CloseableIterator#close()}
-     * it (try-with-resources) so those tables can be reclaimed.
+     * A {@code null} bound is open-ended. Tombstoned keys are omitted.
      */
-    CloseableIterator<Entry> scan(String fromInclusive, String toExclusive);
+    Iterator<Entry> scan(String fromInclusive, String toExclusive);
 }

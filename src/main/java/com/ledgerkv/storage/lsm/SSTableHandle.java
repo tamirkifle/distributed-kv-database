@@ -4,7 +4,6 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * An open {@link SSTable} paired with the metadata compaction needs: its on-disk path, the level
@@ -19,8 +18,6 @@ public final class SSTableHandle implements Closeable {
     private final long sizeBytes;
     private final String firstKey;
     private final String lastKey;
-    /** 1 = the engine's live reference; each in-flight reader adds one; 0 closes the channel. */
-    private final AtomicInteger refCount = new AtomicInteger(1);
 
     private SSTableHandle(SSTable table, Path path, int level, long sizeBytes,
                           String firstKey, String lastKey) {
@@ -78,29 +75,6 @@ public final class SSTableHandle implements Closeable {
             return false;
         }
         return firstKey.compareTo(other.lastKey) <= 0 && other.firstKey.compareTo(lastKey) <= 0;
-    }
-
-    /**
-     * Pins this handle so the background compactor cannot close its channel out from under a reader.
-     * Must be called under the engine's table lock on a handle still in the live set, so the count
-     * always rises from at least 1.
-     */
-    public void pin() {
-        refCount.incrementAndGet();
-    }
-
-    /**
-     * Releases one reference (a reader's pin, or the engine's live reference when the table is
-     * obsoleted). Closes the underlying channel exactly when the last reference is released.
-     */
-    public void unpin() {
-        if (refCount.decrementAndGet() == 0) {
-            try {
-                table.close();
-            } catch (IOException ignore) {
-                // Reclaiming a read-only channel; the file is (or will be) deleted regardless.
-            }
-        }
     }
 
     @Override

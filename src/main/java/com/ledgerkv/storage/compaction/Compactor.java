@@ -116,9 +116,11 @@ public class Compactor implements Closeable {
         CompactionResult result = compact(task);
         context.apply(result);
         for (SSTableHandle obsolete : task.inputs()) {
-            // Release the engine's live reference; the channel closes once the last in-flight
-            // reader that pinned this handle has unpinned it. The file is unlinked now regardless.
-            obsolete.unpin();
+            try {
+                obsolete.close();
+            } catch (IOException ignore) {
+                // Channel may already be closed; deletion below is what matters.
+            }
             Files.deleteIfExists(obsolete.path());
         }
         return true;

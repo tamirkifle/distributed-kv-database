@@ -2,11 +2,13 @@ package com.ledgerkv.quorum;
 
 import com.ledgerkv.QuorumConfig;
 import com.ledgerkv.QuorumResponse;
+import com.ledgerkv.VersionedKVStore;
 import com.ledgerkv.VersionedValue;
 import com.ledgerkv.consistency.ConflictResolutionPolicy;
 import com.ledgerkv.consistency.VersionMetadata;
 import org.junit.jupiter.api.Test;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -18,19 +20,18 @@ class ConflictResolutionTest {
     @Test
     void readReturnsConflictingSiblingsForConcurrentReplicaValues() {
         ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
-        Map<String, ReplicaClient> clients = InMemoryReplicaClient.clusterFor(membership);
+        Map<String, VersionedKVStore> stores = storesFor(membership);
         String key = "trace:run-010";
         String node0 = membership.getNodes().get(0).getId();
         String node1 = membership.getNodes().get(1).getId();
 
-        clients.get(node0).put(key, new VersionedValue("score=0.81", 1, VersionMetadata.initial(node0)));
-        clients.get(node1).put(key, new VersionedValue("score=0.86", 1, VersionMetadata.initial(node1)));
-        clients.get(membership.getNodes().get(2).getId())
-            .put(key, new VersionedValue("score=0.81", 1, VersionMetadata.initial(node0)));
-        LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
+        stores.get(node0).set(key, "score=0.81", VersionMetadata.initial(node0));
+        stores.get(node1).set(key, "score=0.86", VersionMetadata.initial(node1));
+        stores.get(membership.getNodes().get(2).getId()).set(key, "score=0.81", VersionMetadata.initial(node0));
+        LeaderlessKVCluster cluster = new LeaderlessKVCluster(
             membership,
             new QuorumConfig(3, 2, 3),
-            clients
+            stores
         );
 
         QuorumResponse response = cluster.read(0, key);
@@ -47,21 +48,20 @@ class ConflictResolutionTest {
     @Test
     void readReturnsResolvedValueWhenOneVersionDominatesAllReplicas() {
         ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
-        Map<String, ReplicaClient> clients = InMemoryReplicaClient.clusterFor(membership);
+        Map<String, VersionedKVStore> stores = storesFor(membership);
         String key = "trace:run-011";
         String node0 = membership.getNodes().get(0).getId();
         String node1 = membership.getNodes().get(1).getId();
         VersionMetadata oldMetadata = VersionMetadata.initial(node0);
         VersionMetadata latestMetadata = oldMetadata.increment(node1);
 
-        clients.get(node0).put(key, new VersionedValue("score=0.81", 1, oldMetadata));
-        clients.get(node1).put(key, new VersionedValue("score=0.86", 2, latestMetadata));
-        clients.get(membership.getNodes().get(2).getId())
-            .put(key, new VersionedValue("score=0.86", 2, latestMetadata));
-        LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
+        stores.get(node0).set(key, "score=0.81", oldMetadata);
+        stores.get(node1).set(key, "score=0.86", latestMetadata);
+        stores.get(membership.getNodes().get(2).getId()).set(key, "score=0.86", latestMetadata);
+        LeaderlessKVCluster cluster = new LeaderlessKVCluster(
             membership,
             new QuorumConfig(3, 2, 3),
-            clients
+            stores
         );
 
         QuorumResponse response = cluster.read(1, key);
@@ -74,11 +74,9 @@ class ConflictResolutionTest {
 
     @Test
     void nonConflictingLeaderlessReadsKeepResolvedValueBehavior() {
-        ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
         LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
-            membership,
-            new QuorumConfig(3, 2, 2),
-            InMemoryReplicaClient.clusterFor(membership)
+            "test-cluster",
+            new QuorumConfig(3, 2, 2)
         );
 
         cluster.write(1, "trace:run-012", "score=0.91");
@@ -128,6 +126,14 @@ class ConflictResolutionTest {
         assertEquals("score=0.86", firstOrder.getValue().getValue());
         assertEquals(firstOrder.getValue().getValue(), reversedOrder.getValue().getValue());
         assertEquals(firstOrder.getValue().getVersionMetadata(), reversedOrder.getValue().getVersionMetadata());
+    }
+
+    private static Map<String, VersionedKVStore> storesFor(ClusterMembership membership) {
+        Map<String, VersionedKVStore> stores = new LinkedHashMap<>();
+        for (ClusterNode node : membership.getNodes()) {
+            stores.put(node.getId(), new VersionedKVStore());
+        }
+        return stores;
     }
 
     private static List<String> values(List<VersionedValue> versionedValues) {

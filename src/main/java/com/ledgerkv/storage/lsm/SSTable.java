@@ -33,7 +33,6 @@ public final class SSTable implements Closeable {
     private final String[] firstKeys;
     private final long[] blockOffsets;
     private final int[] blockLengths;
-    private int blocksRead;
 
     private SSTable(FileChannel channel, BloomFilter bloom, int entryCount,
                     String[] firstKeys, long[] blockOffsets, int[] blockLengths) {
@@ -167,81 +166,6 @@ public final class SSTable implements Closeable {
         return firstKeys.length;
     }
 
-    /** Test instrumentation: total data-block reads since open (for block-skipping assertions). */
-    int blocksRead() {
-        return blocksRead;
-    }
-
-    /**
-     * Ascending entries whose key is in {@code [fromInclusive, toExclusive)}. Seeks via the sparse
-     * block index to the first block that may contain {@code fromInclusive} (block-skipping: blocks
-     * entirely below {@code from} are never read), and stops before any block whose first key is
-     * {@code >= toExclusive} (sorted blocks ⇒ no later block can hold an in-range key). {@code null}
-     * bounds are open. Tombstones in range pass through verbatim; newest-wins/tombstone resolution
-     * is the {@link MergeIterator}'s job.
-     */
-    public Iterator<Entry> rangeScan(String fromInclusive, String toExclusive) {
-        final int startBlock;
-        if (fromInclusive == null) {
-            startBlock = 0;
-        } else {
-            int fb = findBlock(fromInclusive);
-            startBlock = fb < 0 ? 0 : fb; // from below the table ⇒ start at block 0
-        }
-        return new Iterator<Entry>() {
-            private int blockIdx = startBlock;
-            private Iterator<Entry> current = Collections.emptyIterator();
-            private Entry next;
-            private boolean done;
-
-            {
-                advance();
-            }
-
-            private void advance() {
-                next = null;
-                while (true) {
-                    while (!current.hasNext()) {
-                        if (done || blockIdx >= blockOffsets.length) {
-                            return; // no more blocks
-                        }
-                        // Upper-bound block skip: once a block starts at/after `to`, stop.
-                        if (toExclusive != null && firstKeys[blockIdx].compareTo(toExclusive) >= 0) {
-                            done = true;
-                            return;
-                        }
-                        current = readBlock(blockIdx++).iterator();
-                    }
-                    Entry e = current.next();
-                    if (fromInclusive != null && e.key().compareTo(fromInclusive) < 0) {
-                        continue; // below the lower bound (edge of the start block)
-                    }
-                    if (toExclusive != null && e.key().compareTo(toExclusive) >= 0) {
-                        done = true; // reached the upper bound; ascending ⇒ done
-                        return;
-                    }
-                    next = e;
-                    return;
-                }
-            }
-
-            @Override
-            public boolean hasNext() {
-                return next != null;
-            }
-
-            @Override
-            public Entry next() {
-                if (next == null) {
-                    throw new NoSuchElementException();
-                }
-                Entry result = next;
-                advance();
-                return result;
-            }
-        };
-    }
-
     /** Index of the block that may contain {@code key}: the last block whose firstKey <= key. */
     private int findBlock(String key) {
         int lo = 0;
@@ -260,7 +184,6 @@ public final class SSTable implements Closeable {
     }
 
     private List<Entry> readBlock(int blockIdx) {
-        blocksRead++;
         try {
             int length = blockLengths[blockIdx];
             ByteBuffer buf = ByteBuffer.allocate(length);

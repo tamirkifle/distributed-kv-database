@@ -9,9 +9,8 @@ import com.ledgerkv.checker.OperationRecord;
 import com.ledgerkv.checker.OperationType;
 import com.ledgerkv.quorum.ClusterMembership;
 import com.ledgerkv.quorum.ClusterNode;
-import com.ledgerkv.quorum.InMemoryReplicaClient;
 import com.ledgerkv.quorum.LeaderlessKVCluster;
-import com.ledgerkv.quorum.ReplicaClient;
+import com.ledgerkv.consistency.VersionMetadata;
 
 import org.junit.jupiter.api.Test;
 
@@ -41,12 +40,11 @@ class RandomizedFailureHistoryTest {
         LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
             membership,
             weakConfig,
-            clientsFor(membership, failures)
+            storesFor(membership, failures)
         );
         OperationHistoryRecorder recorder = new OperationHistoryRecorder();
 
-        List<ScenarioStep> steps = scenarioFor(SEED,
-            membership.getPreferenceList(KEY, membership.getReplicationFactor()));
+        List<ScenarioStep> steps = scenarioFor(SEED, membership.selectReplicas(KEY));
         for (int i = 0; i < steps.size(); i++) {
             runStep(cluster, recorder, weakConfig, failures, steps.get(i), i);
         }
@@ -146,13 +144,13 @@ class RandomizedFailureHistoryTest {
             + ")";
     }
 
-    private static Map<String, ReplicaClient> clientsFor(ClusterMembership membership,
-                                                         MutableFailureController failures) {
-        Map<String, ReplicaClient> clients = new LinkedHashMap<>();
+    private static Map<String, VersionedKVStore> storesFor(ClusterMembership membership,
+                                                           MutableFailureController failures) {
+        Map<String, VersionedKVStore> stores = new LinkedHashMap<>();
         for (ClusterNode node : membership.getNodes()) {
-            clients.put(node.getId(), new ControlledFailureReplicaClient(node.getId(), failures));
+            stores.put(node.getId(), new ControlledFailureStore(node.getId(), failures));
         }
-        return clients;
+        return stores;
     }
 
     private static final class ScenarioStep {
@@ -192,38 +190,31 @@ class RandomizedFailureHistoryTest {
         }
     }
 
-    private static final class ControlledFailureReplicaClient implements ReplicaClient {
+    private static final class ControlledFailureStore extends VersionedKVStore {
         private final String nodeId;
         private final MutableFailureController failures;
-        private final InMemoryReplicaClient delegate;
 
-        private ControlledFailureReplicaClient(String nodeId, MutableFailureController failures) {
+        private ControlledFailureStore(String nodeId, MutableFailureController failures) {
             this.nodeId = nodeId;
             this.failures = failures;
-            this.delegate = new InMemoryReplicaClient(nodeId);
         }
 
         @Override
-        public String nodeId() {
-            return nodeId;
+        public long set(String key, String value) {
+            failures.throwIfUnavailable(nodeId);
+            return super.set(key, value);
+        }
+
+        @Override
+        public long set(String key, String value, VersionMetadata versionMetadata) {
+            failures.throwIfUnavailable(nodeId);
+            return super.set(key, value, versionMetadata);
         }
 
         @Override
         public Optional<VersionedValue> get(String key) {
             failures.throwIfUnavailable(nodeId);
-            return delegate.get(key);
-        }
-
-        @Override
-        public void put(String key, VersionedValue value) {
-            failures.throwIfUnavailable(nodeId);
-            delegate.put(key, value);
-        }
-
-        @Override
-        public void deliverHint(String key, VersionedValue value) {
-            failures.throwIfUnavailable(nodeId);
-            delegate.deliverHint(key, value);
+            return super.get(key);
         }
     }
 }
