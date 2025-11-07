@@ -47,6 +47,7 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
 
     private long sequence;                             // guarded by writeLock; monotonic entry seq
     private final AtomicLong nextSstableId = new AtomicLong();
+    private final AtomicLong sstableBytesWritten = new AtomicLong();
 
     private Compactor compactor;                       // null when config.strategy == null (Task 5)
     private volatile boolean closed;
@@ -115,8 +116,8 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
         }
     }
 
-    /** Forces a flush of the active MemTable (package-private test seam). */
-    void flush() {
+    /** Forces a flush of the active MemTable to a new SSTable. */
+    public void flush() {
         synchronized (writeLock) {
             flushLocked();
         }
@@ -125,6 +126,11 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
     /** Number of live SSTables (package-private test seam). */
     int sstableCount() {
         return sstables.size();
+    }
+
+    /** Total bytes written to SSTable files over this engine's lifetime (flush + compaction). */
+    public long sstableBytesWritten() {
+        return sstableBytesWritten.get();
     }
 
     /** The background compactor's last error, or null (package-private test seam). */
@@ -156,6 +162,7 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
                 writer.finish();
             }
             SSTableHandle handle = SSTableHandle.open(path, 0);
+            sstableBytesWritten.addAndGet(handle.sizeBytes());
             synchronized (sstablesLock) {
                 List<SSTableHandle> next = new ArrayList<>(sstables);
                 next.add(handle);
@@ -229,6 +236,9 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
 
     @Override
     public void apply(CompactionResult result) {
+        for (SSTableHandle added : result.added()) {
+            sstableBytesWritten.addAndGet(added.sizeBytes());
+        }
         synchronized (sstablesLock) {
             List<SSTableHandle> next = new ArrayList<>(sstables);
             next.removeAll(result.obsolete());
