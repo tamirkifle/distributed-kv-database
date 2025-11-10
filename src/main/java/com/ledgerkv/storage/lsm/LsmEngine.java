@@ -1,5 +1,6 @@
 package com.ledgerkv.storage.lsm;
 
+import com.ledgerkv.storage.CloseableIterator;
 import com.ledgerkv.storage.StorageEngine;
 import com.ledgerkv.storage.compaction.CompactionContext;
 import com.ledgerkv.storage.compaction.CompactionResult;
@@ -25,12 +26,10 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>Recency is resolved by sequence number: every mutation gets a monotonically increasing
  * sequence, so {@link #get} returns the highest-sequence candidate across the MemTable(s) and
- * SSTables regardless of list order. Reads take no locks — they read volatile snapshots.
- *
- * <p><b>Known limitation:</b> the background compactor deletes obsolete SSTable files after swapping
- * them out, so an in-flight reader holding an older snapshot can race with file reclamation. This
- * narrow race is left for Phase-3 hardening (reference counting); tests avoid it by disabling
- * compaction or quiescing it before reading.
+ * SSTables regardless of list order. Readers pin the live SSTables (reference-counted
+ * {@link SSTableHandle}s) under {@code sstablesLock} for the cheap snapshot only, then read without
+ * holding any lock; the background compactor releases an obsolete table via {@code unpin()} after
+ * the swap, so its channel is closed only once every in-flight reader that pinned it has finished.
  */
 public final class LsmEngine implements StorageEngine, CompactionContext {
 
@@ -189,8 +188,15 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
         if (f != null) {
             best = newer(f.get(key), best);
         }
-        for (SSTableHandle h : sstables) {
-            best = newer(h.table().get(key).orElse(null), best);
+        List<SSTableHandle> pinned = pinnedSnapshot();
+        try {
+            for (SSTableHandle h : pinned) {
+                best = newer(h.table().get(key).orElse(null), best);
+            }
+        } finally {
+            for (SSTableHandle h : pinned) {
+                h.unpin();
+            }
         }
         if (best == null || best.isTombstone()) {
             return Optional.empty();
@@ -199,7 +205,7 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
     }
 
     @Override
-    public Iterator<Entry> scan(String fromInclusive, String toExclusive) {
+    public CloseableIterator<Entry> scan(String fromInclusive, String toExclusive) {
         ensureOpen();
         List<Iterator<Entry>> runs = new ArrayList<>();
         runs.add(active.entries().iterator());
@@ -207,13 +213,14 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
         if (f != null) {
             runs.add(f.entries().iterator());
         }
-        for (SSTableHandle h : sstables) {
+        List<SSTableHandle> pinned = pinnedSnapshot();
+        for (SSTableHandle h : pinned) {
             runs.add(h.table().iterator());
         }
         // dropTombstones=true: the merge resolves newest-wins, so a winning tombstone means the
         // key is deleted and is correctly omitted from the live scan view.
         MergeIterator merged = new MergeIterator(runs, true);
-        return new BoundedIterator(merged, fromInclusive, toExclusive);
+        return new BoundedIterator(merged, fromInclusive, toExclusive, pinned);
     }
 
     /** The higher-sequence of two candidates (either may be null). */
@@ -225,6 +232,22 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
             return candidate;
         }
         return candidate.sequence() > current.sequence() ? candidate : current;
+    }
+
+    /**
+     * Snapshots the live SSTables and pins every handle, atomically under {@code sstablesLock}, so
+     * the background compactor cannot close any of their channels while the caller reads. The caller
+     * MUST {@code unpin()} every returned handle when done. The lock is held only for the cheap
+     * pin bookkeeping — never across a block read.
+     */
+    private List<SSTableHandle> pinnedSnapshot() {
+        synchronized (sstablesLock) {
+            List<SSTableHandle> snapshot = sstables;
+            for (SSTableHandle h : snapshot) {
+                h.pin();
+            }
+            return snapshot;
+        }
     }
 
     // --- CompactionContext (driven by the background Compactor, wired in Task 5) ---
@@ -259,11 +282,7 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
             compactor.close();
         }
         for (SSTableHandle h : sstables) {
-            try {
-                h.close();
-            } catch (IOException ignore) {
-                // best-effort; we still close the WAL below
-            }
+            h.unpin();   // release the engine's live reference; closes when no reader is pinned
         }
         wal.close();
     }
@@ -332,16 +351,19 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
      * Yields the ascending entries of {@code source} whose key is in {@code [from, to)}. Because the
      * source is ascending, it terminates at the first key &gt;= {@code to}. {@code null} bounds are open.
      */
-    private static final class BoundedIterator implements Iterator<Entry> {
+    private static final class BoundedIterator implements CloseableIterator<Entry> {
         private final Iterator<Entry> source;
         private final String from;
         private final String to;
+        private final List<SSTableHandle> pinned;
+        private boolean released;
         private Entry next;
 
-        BoundedIterator(Iterator<Entry> source, String from, String to) {
+        BoundedIterator(Iterator<Entry> source, String from, String to, List<SSTableHandle> pinned) {
             this.source = source;
             this.from = from;
             this.to = to;
+            this.pinned = pinned;
             advance();
         }
 
@@ -353,11 +375,13 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
                     continue;                       // below the lower bound; keep scanning
                 }
                 if (to != null && e.key().compareTo(to) >= 0) {
-                    return;                         // reached the upper bound; ascending ⇒ done
+                    release();                      // reached the upper bound; ascending ⇒ done
+                    return;
                 }
                 next = e;
                 return;
             }
+            release();                              // source exhausted
         }
 
         @Override
@@ -373,6 +397,22 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
             Entry result = next;
             advance();
             return result;
+        }
+
+        @Override
+        public void close() {
+            release();
+        }
+
+        /** Unpins every pinned SSTable exactly once; safe to call repeatedly. */
+        private void release() {
+            if (released) {
+                return;
+            }
+            released = true;
+            for (SSTableHandle h : pinned) {
+                h.unpin();
+            }
         }
     }
 }

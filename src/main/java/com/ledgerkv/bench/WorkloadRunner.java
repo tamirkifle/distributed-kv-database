@@ -1,8 +1,8 @@
 package com.ledgerkv.bench;
 
+import com.ledgerkv.storage.CloseableIterator;
 import com.ledgerkv.storage.StorageEngine;
 import com.ledgerkv.storage.lsm.Entry;
-import java.util.Iterator;
 
 /** Applies {@link Operation}s to a {@link StorageEngine}. */
 public final class WorkloadRunner {
@@ -24,13 +24,14 @@ public final class WorkloadRunner {
                 engine.put(op.key(), op.value());
                 return present + 1;
             case SCAN:
-                Iterator<Entry> it = engine.scan(op.key(), null);
-                int n = 0;
-                while (it.hasNext() && n < op.scanLength()) {
-                    it.next();
-                    n++;
+                try (CloseableIterator<Entry> it = engine.scan(op.key(), null)) {
+                    int n = 0;
+                    while (it.hasNext() && n < op.scanLength()) {
+                        it.next();
+                        n++;
+                    }
+                    return n;
                 }
-                return n;
             default:
                 throw new IllegalArgumentException("unknown op type: " + op.type());
         }

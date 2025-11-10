@@ -1,0 +1,104 @@
+syntax = "proto3";
+
+option java_package = "com.ledgerkv.transport.proto";
+option java_multiple_files = true;
+
+package ledgerkv;
+
+// The node-facing gRPC surface. Carries both client-facing operations
+// (Get/Put/Delete/Scan) and the internal replica/anti-entropy RPCs that
+// the quorum layer wires up in 2c. The storage delegate behind this
+// service is a temporary in-memory map in 2a, replaced by the LSM engine
+// in 2b.
+service LedgerKvNode {
+  // Client-facing operations.
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Scan(ScanRequest) returns (stream ScanEntry);
+
+  // Internal replica RPCs (used by the quorum layer in 2c).
+  rpc ReplicaGet(ReplicaGetRequest) returns (ReplicaGetResponse);
+  rpc ReplicaPut(ReplicaPutRequest) returns (ReplicaPutResponse);
+  rpc DeliverHint(HintRequest) returns (HintResponse);
+}
+
+// Version metadata carried alongside a value (mirrors VersionMetadata).
+message VersionMetadataPb {
+  int64 timestamp = 1;
+  string origin_node = 2;
+}
+
+// A versioned value as it travels on the wire. Full population happens in
+// 2b/2c; the schema is fixed now so the replica RPCs have a stable shape.
+message VersionedValuePb {
+  bytes value = 1;
+  int64 version = 2;
+  bool tombstone = 3;
+  VersionMetadataPb metadata = 4;
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  bool found = 1;
+  VersionedValuePb value = 2;
+}
+
+message PutRequest {
+  string key = 1;
+  bytes value = 2;
+}
+
+message PutResponse {
+  int64 version = 1;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  bool existed = 1;
+}
+
+message ScanRequest {
+  string start_key = 1;
+  string end_key = 2;
+  int32 limit = 3;
+}
+
+message ScanEntry {
+  string key = 1;
+  VersionedValuePb value = 2;
+}
+
+message ReplicaGetRequest {
+  string key = 1;
+}
+
+message ReplicaGetResponse {
+  bool found = 1;
+  VersionedValuePb value = 2;
+}
+
+message ReplicaPutRequest {
+  string key = 1;
+  VersionedValuePb value = 2;
+}
+
+message ReplicaPutResponse {
+  bool ok = 1;
+}
+
+message HintRequest {
+  string target_node = 1;
+  string key = 2;
+  VersionedValuePb value = 3;
+}
+
+message HintResponse {
+  bool accepted = 1;
+}
