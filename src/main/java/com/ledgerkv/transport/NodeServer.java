@@ -1,6 +1,10 @@
 package com.ledgerkv.transport;
 
 import com.google.protobuf.ByteString;
+import com.ledgerkv.consistency.VersionMetadata;
+import com.ledgerkv.storage.CloseableIterator;
+import com.ledgerkv.storage.lsm.Entry;
+import com.ledgerkv.storage.lsm.LsmEngine;
 import com.ledgerkv.transport.proto.DeleteRequest;
 import com.ledgerkv.transport.proto.DeleteResponse;
 import com.ledgerkv.transport.proto.GetRequest;
@@ -15,28 +19,28 @@ import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.grpc.stub.StreamObserver;
 import java.io.IOException;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentSkipListMap;
+import java.nio.file.Path;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * A gRPC server exposing the {@code LedgerKvNode} service over a real channel.
+ * A gRPC server exposing the {@code LedgerKvNode} service backed by a per-node {@link LsmEngine}.
  *
- * <p>In 2a the service delegates to a temporary in-process store — an ordered map of
- * key to value plus a per-key monotonic version counter. This stand-in is
- * <strong>replaced by the LSM engine in 2b</strong>; the transport surface stays the same.
+ * <p>Values are persisted as {@link StoredValue}s (value bytes + version + tombstone +
+ * {@link VersionMetadata}) serialized through {@link StoredValueCodec}. The replica/quorum layer
+ * that supplies real version metadata is wired in 2c; in 2b the node assigns a simple per-key
+ * monotonic version derived from the current live value.
  */
 public final class NodeServer implements AutoCloseable {
 
-    private final int requestedPort;
     private final Server server;
+    private final LsmEngine engine;
 
-    private NodeServer(int requestedPort) {
-        this.requestedPort = requestedPort;
+    private NodeServer(int requestedPort, LsmEngine engine) {
+        this.engine = engine;
         this.server = ServerBuilder.forPort(requestedPort)
-                .addService(new LedgerKvNodeService())
+                .addService(new LedgerKvNodeService(engine))
                 .build();
     }
 
@@ -55,46 +59,55 @@ public final class NodeServer implements AutoCloseable {
         return server.getPort();
     }
 
-    /** Gracefully shuts the server down, waiting briefly for in-flight RPCs. */
+    /** Gracefully shuts the server down (waiting briefly for in-flight RPCs), then the engine. */
     @Override
-    public void close() throws InterruptedException {
+    public void close() throws IOException, InterruptedException {
         server.shutdown();
         if (!server.awaitTermination(5, TimeUnit.SECONDS)) {
             server.shutdownNow();
         }
+        engine.close();
     }
 
     public static final class Builder {
         private final int port;
+        private Path dataDir;
 
         private Builder(int port) {
             this.port = port;
         }
 
-        public NodeServer build() {
-            return new NodeServer(port);
+        /** The directory the backing {@link LsmEngine} stores its WAL + SSTables in. */
+        public Builder dataDir(Path dataDir) {
+            this.dataDir = dataDir;
+            return this;
+        }
+
+        public NodeServer build() throws IOException {
+            Objects.requireNonNull(dataDir, "dataDir must be set");
+            return new NodeServer(port, LsmEngine.open(dataDir));
         }
     }
 
     /**
-     * Temporary in-memory implementation of the node service. Keys are held in a sorted
-     * map so {@code Scan} can stream a key range in ascending order without re-sorting.
+     * Implements the node service by delegating to the {@link LsmEngine}, encoding values through
+     * {@link StoredValueCodec} on the way in and decoding on the way out.
      */
     private static final class LedgerKvNodeService extends LedgerKvNodeGrpc.LedgerKvNodeImplBase {
 
-        private final ConcurrentSkipListMap<String, byte[]> store = new ConcurrentSkipListMap<>();
-        private final Map<String, AtomicLong> versions = new ConcurrentHashMap<>();
+        private final LsmEngine engine;
+
+        LedgerKvNodeService(LsmEngine engine) {
+            this.engine = engine;
+        }
 
         @Override
         public void get(GetRequest request, StreamObserver<GetResponse> responseObserver) {
-            byte[] value = store.get(request.getKey());
+            Optional<byte[]> stored = engine.get(request.getKey());
             GetResponse.Builder resp = GetResponse.newBuilder();
-            if (value != null) {
-                resp.setFound(true)
-                        .setValue(VersionedValuePb.newBuilder()
-                                .setValue(ByteString.copyFrom(value))
-                                .setVersion(currentVersion(request.getKey()))
-                                .build());
+            if (stored.isPresent()) {
+                StoredValue value = StoredValueCodec.decode(stored.get());
+                resp.setFound(true).setValue(toProto(value));
             }
             responseObserver.onNext(resp.build());
             responseObserver.onCompleted();
@@ -102,17 +115,21 @@ public final class NodeServer implements AutoCloseable {
 
         @Override
         public void put(PutRequest request, StreamObserver<PutResponse> responseObserver) {
-            store.put(request.getKey(), request.getValue().toByteArray());
-            long version = versions
-                    .computeIfAbsent(request.getKey(), k -> new AtomicLong())
-                    .incrementAndGet();
-            responseObserver.onNext(PutResponse.newBuilder().setVersion(version).build());
+            long nextVersion = currentVersion(request.getKey()) + 1;
+            StoredValue value = new StoredValue(
+                    request.getValue().toByteArray(),
+                    nextVersion,
+                    false,
+                    VersionMetadata.legacy(nextVersion));
+            engine.put(request.getKey(), StoredValueCodec.encode(value));
+            responseObserver.onNext(PutResponse.newBuilder().setVersion(nextVersion).build());
             responseObserver.onCompleted();
         }
 
         @Override
         public void delete(DeleteRequest request, StreamObserver<DeleteResponse> responseObserver) {
-            boolean existed = store.remove(request.getKey()) != null;
+            boolean existed = engine.get(request.getKey()).isPresent();
+            engine.delete(request.getKey());
             responseObserver.onNext(DeleteResponse.newBuilder().setExisted(existed).build());
             responseObserver.onCompleted();
         }
@@ -121,26 +138,42 @@ public final class NodeServer implements AutoCloseable {
         public void scan(ScanRequest request, StreamObserver<ScanEntry> responseObserver) {
             int limit = request.getLimit();
             int emitted = 0;
-            for (Map.Entry<String, byte[]> entry :
-                    store.subMap(request.getStartKey(), request.getEndKey()).entrySet()) {
-                if (limit > 0 && emitted >= limit) {
-                    break;
+            try (CloseableIterator<Entry> entries =
+                    engine.scan(request.getStartKey(), request.getEndKey())) {
+                while (entries.hasNext()) {
+                    if (limit > 0 && emitted >= limit) {
+                        break;
+                    }
+                    Entry entry = entries.next();
+                    StoredValue value = StoredValueCodec.decode(entry.value());
+                    responseObserver.onNext(ScanEntry.newBuilder()
+                            .setKey(entry.key())
+                            .setValue(toProto(value))
+                            .build());
+                    emitted++;
                 }
-                responseObserver.onNext(ScanEntry.newBuilder()
-                        .setKey(entry.getKey())
-                        .setValue(VersionedValuePb.newBuilder()
-                                .setValue(ByteString.copyFrom(entry.getValue()))
-                                .setVersion(currentVersion(entry.getKey()))
-                                .build())
-                        .build());
-                emitted++;
             }
             responseObserver.onCompleted();
         }
 
+        /** The version of the current live value for {@code key}, or 0 if absent. */
         private long currentVersion(String key) {
-            AtomicLong v = versions.get(key);
-            return v == null ? 0L : v.get();
+            return engine.get(key)
+                    .map(bytes -> StoredValueCodec.decode(bytes).version())
+                    .orElse(0L);
+        }
+
+        /**
+         * Maps a {@link StoredValue} onto the wire message. Only value + version are populated in
+         * 2b; the {@code VersionedValuePb} metadata block (timestamp + origin_node) cannot carry
+         * the vector clock and is reconciled in 2c.
+         */
+        private static VersionedValuePb toProto(StoredValue value) {
+            return VersionedValuePb.newBuilder()
+                    .setValue(ByteString.copyFrom(value.value()))
+                    .setVersion(value.version())
+                    .setTombstone(value.tombstone())
+                    .build();
         }
     }
 }

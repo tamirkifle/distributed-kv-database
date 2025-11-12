@@ -7,12 +7,14 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.ledgerkv.transport.proto.ScanEntry;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 /**
  * End-to-end loopback test that drives a real gRPC {@link NodeServer} over the wire
@@ -21,12 +23,15 @@ import org.junit.jupiter.api.Test;
  */
 class NodeServerLoopbackTest {
 
+    @TempDir
+    Path dataDir;
+
     private NodeServer server;
     private NodeClient client;
 
     @BeforeEach
     void setUp() throws Exception {
-        server = NodeServer.builder(0).build();
+        server = NodeServer.builder(0).dataDir(dataDir).build();
         server.start();
         client = NodeClient.connect("localhost", server.port());
     }
@@ -62,6 +67,29 @@ class NodeServerLoopbackTest {
         // Delete removes the key.
         assertTrue(client.delete("k1"));
         assertFalse(client.get("k1").isPresent());
+    }
+
+    @Test
+    void persistsAcrossRestart() throws Exception {
+        client.put("p", bytes("durable"));
+
+        // Tear down the first server/client; reopen a fresh pair over the SAME data directory.
+        client.close();
+        server.close();
+        client = null;
+        server = null;
+
+        NodeServer reopened = NodeServer.builder(0).dataDir(dataDir).build();
+        reopened.start();
+        NodeClient reconnected = NodeClient.connect("localhost", reopened.port());
+        try {
+            Optional<byte[]> read = reconnected.get("p");
+            assertTrue(read.isPresent());
+            assertArrayEquals(bytes("durable"), read.get());
+        } finally {
+            reconnected.close();
+            reopened.close();
+        }
     }
 
     private static byte[] bytes(String s) {
