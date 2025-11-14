@@ -1,6 +1,5 @@
 package com.ledgerkv.transport;
 
-import com.google.protobuf.ByteString;
 import com.ledgerkv.consistency.VersionMetadata;
 import com.ledgerkv.storage.CloseableIterator;
 import com.ledgerkv.storage.lsm.Entry;
@@ -9,9 +8,15 @@ import com.ledgerkv.transport.proto.DeleteRequest;
 import com.ledgerkv.transport.proto.DeleteResponse;
 import com.ledgerkv.transport.proto.GetRequest;
 import com.ledgerkv.transport.proto.GetResponse;
+import com.ledgerkv.transport.proto.HintRequest;
+import com.ledgerkv.transport.proto.HintResponse;
 import com.ledgerkv.transport.proto.LedgerKvNodeGrpc;
 import com.ledgerkv.transport.proto.PutRequest;
 import com.ledgerkv.transport.proto.PutResponse;
+import com.ledgerkv.transport.proto.ReplicaGetRequest;
+import com.ledgerkv.transport.proto.ReplicaGetResponse;
+import com.ledgerkv.transport.proto.ReplicaPutRequest;
+import com.ledgerkv.transport.proto.ReplicaPutResponse;
 import com.ledgerkv.transport.proto.ScanEntry;
 import com.ledgerkv.transport.proto.ScanRequest;
 import com.ledgerkv.transport.proto.VersionedValuePb;
@@ -107,7 +112,7 @@ public final class NodeServer implements AutoCloseable {
             GetResponse.Builder resp = GetResponse.newBuilder();
             if (stored.isPresent()) {
                 StoredValue value = StoredValueCodec.decode(stored.get());
-                resp.setFound(true).setValue(toProto(value));
+                resp.setFound(true).setValue(VersionedValueProtos.toProto(value));
             }
             responseObserver.onNext(resp.build());
             responseObserver.onCompleted();
@@ -148,7 +153,7 @@ public final class NodeServer implements AutoCloseable {
                     StoredValue value = StoredValueCodec.decode(entry.value());
                     responseObserver.onNext(ScanEntry.newBuilder()
                             .setKey(entry.key())
-                            .setValue(toProto(value))
+                            .setValue(VersionedValueProtos.toProto(value))
                             .build());
                     emitted++;
                 }
@@ -156,24 +161,46 @@ public final class NodeServer implements AutoCloseable {
             responseObserver.onCompleted();
         }
 
+        @Override
+        public void replicaGet(ReplicaGetRequest request,
+                StreamObserver<ReplicaGetResponse> responseObserver) {
+            Optional<byte[]> stored = engine.get(request.getKey());
+            ReplicaGetResponse.Builder resp = ReplicaGetResponse.newBuilder();
+            if (stored.isPresent()) {
+                StoredValue value = StoredValueCodec.decode(stored.get());
+                resp.setFound(true).setValue(VersionedValueProtos.toProto(value));
+            }
+            responseObserver.onNext(resp.build());
+            responseObserver.onCompleted();
+        }
+
+        @Override
+        public void replicaPut(ReplicaPutRequest request,
+                StreamObserver<ReplicaPutResponse> responseObserver) {
+            storeVerbatim(request.getKey(), request.getValue());
+            responseObserver.onNext(ReplicaPutResponse.newBuilder().setOk(true).build());
+            responseObserver.onCompleted();
+        }
+
+        @Override
+        public void deliverHint(HintRequest request, StreamObserver<HintResponse> responseObserver) {
+            // The hint's target_node is this server; store the carried value verbatim.
+            storeVerbatim(request.getKey(), request.getValue());
+            responseObserver.onNext(HintResponse.newBuilder().setAccepted(true).build());
+            responseObserver.onCompleted();
+        }
+
+        /** Persists the coordinator-supplied versioned value exactly as received (no re-versioning). */
+        private void storeVerbatim(String key, VersionedValuePb value) {
+            StoredValue stored = VersionedValueProtos.fromProto(value);
+            engine.put(key, StoredValueCodec.encode(stored));
+        }
+
         /** The version of the current live value for {@code key}, or 0 if absent. */
         private long currentVersion(String key) {
             return engine.get(key)
                     .map(bytes -> StoredValueCodec.decode(bytes).version())
                     .orElse(0L);
-        }
-
-        /**
-         * Maps a {@link StoredValue} onto the wire message. Only value + version are populated in
-         * 2b; the {@code VersionedValuePb} metadata block (timestamp + origin_node) cannot carry
-         * the vector clock and is reconciled in 2c.
-         */
-        private static VersionedValuePb toProto(StoredValue value) {
-            return VersionedValuePb.newBuilder()
-                    .setValue(ByteString.copyFrom(value.value()))
-                    .setVersion(value.version())
-                    .setTombstone(value.tombstone())
-                    .build();
         }
     }
 }

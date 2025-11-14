@@ -4,9 +4,13 @@ import com.google.protobuf.ByteString;
 import com.ledgerkv.transport.proto.DeleteRequest;
 import com.ledgerkv.transport.proto.GetRequest;
 import com.ledgerkv.transport.proto.GetResponse;
+import com.ledgerkv.transport.proto.HintRequest;
 import com.ledgerkv.transport.proto.LedgerKvNodeGrpc;
 import com.ledgerkv.transport.proto.PutRequest;
 import com.ledgerkv.transport.proto.PutResponse;
+import com.ledgerkv.transport.proto.ReplicaGetRequest;
+import com.ledgerkv.transport.proto.ReplicaGetResponse;
+import com.ledgerkv.transport.proto.ReplicaPutRequest;
 import com.ledgerkv.transport.proto.ScanEntry;
 import com.ledgerkv.transport.proto.ScanRequest;
 import io.grpc.ManagedChannel;
@@ -74,6 +78,33 @@ public final class NodeClient implements AutoCloseable {
             entries.add(stream.next());
         }
         return entries;
+    }
+
+    /** Internal replica read: returns the stored versioned value for {@code key}, or empty. */
+    public Optional<StoredValue> replicaGet(String key) {
+        ReplicaGetResponse response =
+                stub.replicaGet(ReplicaGetRequest.newBuilder().setKey(key).build());
+        if (!response.getFound()) {
+            return Optional.empty();
+        }
+        return Optional.of(VersionedValueProtos.fromProto(response.getValue()));
+    }
+
+    /** Internal replica write: stores {@code value} under {@code key} verbatim (no re-versioning). */
+    public void replicaPut(String key, StoredValue value) {
+        stub.replicaPut(ReplicaPutRequest.newBuilder()
+                .setKey(key)
+                .setValue(VersionedValueProtos.toProto(value))
+                .build());
+    }
+
+    /** Delivers a hinted-handoff write for {@code targetNodeId} to this node, stored verbatim. */
+    public void deliverHint(String targetNodeId, String key, StoredValue value) {
+        stub.deliverHint(HintRequest.newBuilder()
+                .setTargetNode(targetNodeId)
+                .setKey(key)
+                .setValue(VersionedValueProtos.toProto(value))
+                .build());
     }
 
     @Override
