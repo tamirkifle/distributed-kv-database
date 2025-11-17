@@ -2,15 +2,11 @@ package com.ledgerkv.quorum;
 
 import com.ledgerkv.QuorumConfig;
 import com.ledgerkv.QuorumResponse;
-import com.ledgerkv.VersionedKVStore;
 import com.ledgerkv.VersionedValue;
-import com.ledgerkv.consistency.VersionMetadata;
 import org.junit.jupiter.api.Test;
 
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -19,13 +15,16 @@ class HintedHandoffTest {
     @Test
     void successfulPartialWriteRecordsHintForUnavailableReplica() {
         ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
-        Map<String, VersionedKVStore> stores = storesFor(membership);
+        Map<String, ReplicaClient> clients = InMemoryReplicaClient.clusterFor(membership);
         String unavailableNodeId = membership.getNodes().get(1).getId();
-        stores.put(unavailableNodeId, new ToggleableStore(false));
-        LeaderlessKVCluster cluster = new LeaderlessKVCluster(
+        PartitionableReplicaClient unavailable =
+            new PartitionableReplicaClient(clients.get(unavailableNodeId));
+        unavailable.setAvailable(false);
+        clients.put(unavailableNodeId, unavailable);
+        LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
             membership,
             new QuorumConfig(3, 2, 2),
-            stores
+            clients
         );
 
         QuorumResponse response = cluster.write(0, "trace:run-009", "score=0.91");
@@ -44,19 +43,21 @@ class HintedHandoffTest {
     @Test
     void replayKeepsFailedHintsPendingAndClearsAppliedHints() {
         ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
-        Map<String, VersionedKVStore> stores = storesFor(membership);
+        Map<String, ReplicaClient> clients = InMemoryReplicaClient.clusterFor(membership);
         String unavailableNodeId = membership.getNodes().get(1).getId();
-        ToggleableStore recoveringStore = new ToggleableStore(false);
-        stores.put(unavailableNodeId, recoveringStore);
-        LeaderlessKVCluster cluster = new LeaderlessKVCluster(
+        PartitionableReplicaClient recovering =
+            new PartitionableReplicaClient(clients.get(unavailableNodeId));
+        recovering.setAvailable(false);
+        clients.put(unavailableNodeId, recovering);
+        LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
             membership,
             new QuorumConfig(3, 2, 2),
-            stores
+            clients
         );
         QuorumResponse writeResponse = cluster.write(0, "trace:run-010", "score=0.93");
 
         HintedHandoffReplayResult failedReplay = cluster.replayPendingHints();
-        recoveringStore.setAvailable(true);
+        recovering.setAvailable(true);
         HintedHandoffReplayResult successfulReplay = cluster.replayPendingHints();
 
         assertEquals(1, failedReplay.getAttemptedCount());
@@ -71,49 +72,5 @@ class HintedHandoffTest {
             .orElseThrow(() -> new AssertionError("expected hinted value on recovered replica"));
         assertEquals("score=0.93", recoveredValue.getValue());
         assertEquals(writeResponse.getValue().getVersionMetadata(), recoveredValue.getVersionMetadata());
-    }
-
-    private static Map<String, VersionedKVStore> storesFor(ClusterMembership membership) {
-        Map<String, VersionedKVStore> stores = new LinkedHashMap<>();
-        for (ClusterNode node : membership.getNodes()) {
-            stores.put(node.getId(), new VersionedKVStore());
-        }
-        return stores;
-    }
-
-    private static final class ToggleableStore extends VersionedKVStore {
-        private boolean available;
-
-        private ToggleableStore(boolean available) {
-            this.available = available;
-        }
-
-        private void setAvailable(boolean available) {
-            this.available = available;
-        }
-
-        @Override
-        public long set(String key, String value) {
-            if (!available) {
-                throw new IllegalStateException("replica unavailable");
-            }
-            return super.set(key, value);
-        }
-
-        @Override
-        public long set(String key, String value, VersionMetadata versionMetadata) {
-            if (!available) {
-                throw new IllegalStateException("replica unavailable");
-            }
-            return super.set(key, value, versionMetadata);
-        }
-
-        @Override
-        public Optional<VersionedValue> get(String key) {
-            if (!available) {
-                throw new IllegalStateException("replica unavailable");
-            }
-            return super.get(key);
-        }
     }
 }

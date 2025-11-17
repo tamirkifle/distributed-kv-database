@@ -2,15 +2,12 @@ package com.ledgerkv.quorum;
 
 import com.ledgerkv.QuorumConfig;
 import com.ledgerkv.QuorumResponse;
-import com.ledgerkv.VersionedKVStore;
 import com.ledgerkv.VersionedValue;
 import com.ledgerkv.consistency.VersionMetadata;
 import com.ledgerkv.failure.FailureCause;
 import org.junit.jupiter.api.Test;
 
-import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -19,13 +16,16 @@ class FailureInjectionTest {
     @Test
     void failedWriteQuorumReportsRespondingAndFailedReplicaIds() {
         ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
-        Map<String, VersionedKVStore> stores = storesFor(membership);
+        Map<String, ReplicaClient> clients = InMemoryReplicaClient.clusterFor(membership);
         String failedNodeId = membership.getNodes().get(1).getId();
-        stores.put(failedNodeId, new UnavailableStore());
-        LeaderlessKVCluster cluster = new LeaderlessKVCluster(
+        PartitionableReplicaClient failed =
+            new PartitionableReplicaClient(clients.get(failedNodeId));
+        failed.setAvailable(false);
+        clients.put(failedNodeId, failed);
+        LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
             membership,
             new QuorumConfig(3, 3, 2),
-            stores
+            clients
         );
 
         QuorumResponse response = cluster.write(0, "trace:run-007", "score=0.77");
@@ -42,16 +42,20 @@ class FailureInjectionTest {
     @Test
     void failedReadQuorumReportsRespondingAndFailedReplicaIds() {
         ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
-        Map<String, VersionedKVStore> stores = storesFor(membership);
-        for (VersionedKVStore store : stores.values()) {
-            store.set("trace:run-008", "score=0.89");
+        Map<String, ReplicaClient> clients = InMemoryReplicaClient.clusterFor(membership);
+        VersionedValue seeded = new VersionedValue("score=0.89", 1, VersionMetadata.legacy(1));
+        for (ReplicaClient client : clients.values()) {
+            client.put("trace:run-008", seeded);
         }
         String failedNodeId = membership.getNodes().get(2).getId();
-        stores.put(failedNodeId, new UnavailableStore());
-        LeaderlessKVCluster cluster = new LeaderlessKVCluster(
+        PartitionableReplicaClient failed =
+            new PartitionableReplicaClient(clients.get(failedNodeId));
+        failed.setAvailable(false);
+        clients.put(failedNodeId, failed);
+        LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
             membership,
             new QuorumConfig(3, 2, 3),
-            stores
+            clients
         );
 
         QuorumResponse response = cluster.read(1, "trace:run-008");
@@ -63,30 +67,5 @@ class FailureInjectionTest {
             FailureCause.UNAVAILABLE_NODE,
             response.getFailureContext().getFailureCauses().get(failedNodeId)
         );
-    }
-
-    private static Map<String, VersionedKVStore> storesFor(ClusterMembership membership) {
-        Map<String, VersionedKVStore> stores = new LinkedHashMap<>();
-        for (ClusterNode node : membership.getNodes()) {
-            stores.put(node.getId(), new VersionedKVStore());
-        }
-        return stores;
-    }
-
-    private static final class UnavailableStore extends VersionedKVStore {
-        @Override
-        public long set(String key, String value) {
-            throw new IllegalStateException("replica unavailable");
-        }
-
-        @Override
-        public long set(String key, String value, VersionMetadata versionMetadata) {
-            throw new IllegalStateException("replica unavailable");
-        }
-
-        @Override
-        public Optional<VersionedValue> get(String key) {
-            throw new IllegalStateException("replica unavailable");
-        }
     }
 }

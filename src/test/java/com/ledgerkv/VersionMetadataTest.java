@@ -1,5 +1,7 @@
 package com.ledgerkv;
 
+import com.ledgerkv.quorum.ClusterMembership;
+import com.ledgerkv.quorum.InMemoryReplicaClient;
 import com.ledgerkv.quorum.LeaderlessKVCluster;
 import com.ledgerkv.consistency.VersionMetadata;
 import org.junit.jupiter.api.Test;
@@ -29,9 +31,11 @@ class VersionMetadataTest {
 
     @Test
     void leaderlessWritesAttachOrderedVersionMetadata() {
+        ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
         LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
-            "test-cluster",
-            new QuorumConfig(3, 2, 2)
+            membership,
+            new QuorumConfig(3, 2, 2),
+            InMemoryReplicaClient.clusterFor(membership)
         );
 
         QuorumResponse firstWrite = cluster.write(0, "trace:run-009", "score=0.81");

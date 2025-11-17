@@ -1,6 +1,8 @@
 package com.ledgerkv;
 
+import com.ledgerkv.quorum.ClusterMembership;
 import com.ledgerkv.quorum.ClusterNode;
+import com.ledgerkv.quorum.InMemoryReplicaClient;
 import com.ledgerkv.quorum.LeaderlessKVCluster;
 import org.junit.jupiter.api.Test;
 
@@ -10,12 +12,15 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class LeaderlessKVClusterTest {
 
+    private static LeaderlessKVCluster clusterFor(QuorumConfig config) {
+        ClusterMembership membership =
+            ClusterMembership.create("test-cluster", config.getN(), config.getN());
+        return LeaderlessKVCluster.create(membership, config, InMemoryReplicaClient.clusterFor(membership));
+    }
+
     @Test
     void anyNodeCanCoordinateWritesToTheSameReplicaSet() {
-        LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
-            "test-cluster",
-            new QuorumConfig(3, 2, 2)
-        );
+        LeaderlessKVCluster cluster = clusterFor(new QuorumConfig(3, 2, 2));
 
         QuorumResponse firstWrite = cluster.write(0, "trace:run-001", "baseline-score=0.82");
         QuorumResponse secondWrite = cluster.write(2, "trace:run-001", "baseline-score=0.91");
@@ -33,10 +38,7 @@ class LeaderlessKVClusterTest {
 
     @Test
     void anyNodeCanCoordinateReadsFromTheSameReplicaSet() {
-        LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
-            "test-cluster",
-            new QuorumConfig(3, 2, 2)
-        );
+        LeaderlessKVCluster cluster = clusterFor(new QuorumConfig(3, 2, 2));
 
         cluster.write(1, "trace:run-002", "candidate-score=0.87");
 
@@ -52,10 +54,7 @@ class LeaderlessKVClusterTest {
 
     @Test
     void replicaSelectionIsIndependentOfCoordinatorChoice() {
-        LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
-            "test-cluster",
-            new QuorumConfig(5, 3, 3)
-        );
+        LeaderlessKVCluster cluster = clusterFor(new QuorumConfig(5, 3, 3));
 
         List<ClusterNode> coordinator0Replicas = cluster.selectReplicas("trace:run-003");
         cluster.write(0, "trace:run-003", "score=0.73");
@@ -67,10 +66,7 @@ class LeaderlessKVClusterTest {
 
     @Test
     void rejectsInvalidCoordinatorIndex() {
-        LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
-            "test-cluster",
-            new QuorumConfig(3, 2, 2)
-        );
+        LeaderlessKVCluster cluster = clusterFor(new QuorumConfig(3, 2, 2));
 
         assertThrows(IllegalArgumentException.class,
             () -> cluster.write(-1, "trace:run-004", "score=0.65"));

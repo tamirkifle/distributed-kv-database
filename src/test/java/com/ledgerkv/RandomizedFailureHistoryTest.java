@@ -9,8 +9,9 @@ import com.ledgerkv.checker.OperationRecord;
 import com.ledgerkv.checker.OperationType;
 import com.ledgerkv.quorum.ClusterMembership;
 import com.ledgerkv.quorum.ClusterNode;
+import com.ledgerkv.quorum.InMemoryReplicaClient;
 import com.ledgerkv.quorum.LeaderlessKVCluster;
-import com.ledgerkv.consistency.VersionMetadata;
+import com.ledgerkv.quorum.ReplicaClient;
 
 import org.junit.jupiter.api.Test;
 
@@ -40,7 +41,7 @@ class RandomizedFailureHistoryTest {
         LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
             membership,
             weakConfig,
-            storesFor(membership, failures)
+            clientsFor(membership, failures)
         );
         OperationHistoryRecorder recorder = new OperationHistoryRecorder();
 
@@ -144,13 +145,13 @@ class RandomizedFailureHistoryTest {
             + ")";
     }
 
-    private static Map<String, VersionedKVStore> storesFor(ClusterMembership membership,
-                                                           MutableFailureController failures) {
-        Map<String, VersionedKVStore> stores = new LinkedHashMap<>();
+    private static Map<String, ReplicaClient> clientsFor(ClusterMembership membership,
+                                                         MutableFailureController failures) {
+        Map<String, ReplicaClient> clients = new LinkedHashMap<>();
         for (ClusterNode node : membership.getNodes()) {
-            stores.put(node.getId(), new ControlledFailureStore(node.getId(), failures));
+            clients.put(node.getId(), new ControlledFailureReplicaClient(node.getId(), failures));
         }
-        return stores;
+        return clients;
     }
 
     private static final class ScenarioStep {
@@ -190,31 +191,38 @@ class RandomizedFailureHistoryTest {
         }
     }
 
-    private static final class ControlledFailureStore extends VersionedKVStore {
+    private static final class ControlledFailureReplicaClient implements ReplicaClient {
         private final String nodeId;
         private final MutableFailureController failures;
+        private final InMemoryReplicaClient delegate;
 
-        private ControlledFailureStore(String nodeId, MutableFailureController failures) {
+        private ControlledFailureReplicaClient(String nodeId, MutableFailureController failures) {
             this.nodeId = nodeId;
             this.failures = failures;
+            this.delegate = new InMemoryReplicaClient(nodeId);
         }
 
         @Override
-        public long set(String key, String value) {
-            failures.throwIfUnavailable(nodeId);
-            return super.set(key, value);
-        }
-
-        @Override
-        public long set(String key, String value, VersionMetadata versionMetadata) {
-            failures.throwIfUnavailable(nodeId);
-            return super.set(key, value, versionMetadata);
+        public String nodeId() {
+            return nodeId;
         }
 
         @Override
         public Optional<VersionedValue> get(String key) {
             failures.throwIfUnavailable(nodeId);
-            return super.get(key);
+            return delegate.get(key);
+        }
+
+        @Override
+        public void put(String key, VersionedValue value) {
+            failures.throwIfUnavailable(nodeId);
+            delegate.put(key, value);
+        }
+
+        @Override
+        public void deliverHint(String key, VersionedValue value) {
+            failures.throwIfUnavailable(nodeId);
+            delegate.deliverHint(key, value);
         }
     }
 }
