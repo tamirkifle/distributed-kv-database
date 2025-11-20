@@ -22,7 +22,6 @@ import com.ledgerkv.transport.proto.ScanRequest;
 import com.ledgerkv.transport.proto.VersionedValuePb;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
-import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -42,22 +41,12 @@ public final class NodeServer implements AutoCloseable {
 
     private final Server server;
     private final LsmEngine engine;
-    private final LedgerKvNodeService service;
 
     private NodeServer(int requestedPort, LsmEngine engine) {
         this.engine = engine;
-        this.service = new LedgerKvNodeService(engine);
         this.server = ServerBuilder.forPort(requestedPort)
-                .addService(service)
+                .addService(new LedgerKvNodeService(engine))
                 .build();
-    }
-
-    /**
-     * Routes this node's <em>public</em> Get/Put through {@code coordinator} (a quorum coordinator)
-     * instead of straight to local disk. Internal replica RPCs always hit the local engine.
-     */
-    public void useCoordinator(ClientCoordinator coordinator) {
-        service.setCoordinator(coordinator);
     }
 
     public static Builder builder(int port) {
@@ -112,32 +101,13 @@ public final class NodeServer implements AutoCloseable {
     private static final class LedgerKvNodeService extends LedgerKvNodeGrpc.LedgerKvNodeImplBase {
 
         private final LsmEngine engine;
-        private volatile ClientCoordinator coordinator;
 
         LedgerKvNodeService(LsmEngine engine) {
             this.engine = engine;
         }
 
-        void setCoordinator(ClientCoordinator coordinator) {
-            this.coordinator = coordinator;
-        }
-
         @Override
         public void get(GetRequest request, StreamObserver<GetResponse> responseObserver) {
-            ClientCoordinator coord = coordinator;
-            if (coord != null) {
-                try {
-                    Optional<StoredValue> value = coord.get(request.getKey());
-                    GetResponse.Builder resp = GetResponse.newBuilder();
-                    value.ifPresent(v -> resp.setFound(true).setValue(VersionedValueProtos.toProto(v)));
-                    responseObserver.onNext(resp.build());
-                    responseObserver.onCompleted();
-                } catch (RuntimeException e) {
-                    responseObserver.onError(
-                            Status.UNAVAILABLE.withDescription(e.getMessage()).asRuntimeException());
-                }
-                return;
-            }
             Optional<byte[]> stored = engine.get(request.getKey());
             GetResponse.Builder resp = GetResponse.newBuilder();
             if (stored.isPresent()) {
@@ -150,19 +120,6 @@ public final class NodeServer implements AutoCloseable {
 
         @Override
         public void put(PutRequest request, StreamObserver<PutResponse> responseObserver) {
-            ClientCoordinator coord = coordinator;
-            if (coord != null) {
-                try {
-                    StoredValue stored = coord.put(request.getKey(), request.getValue().toByteArray());
-                    responseObserver.onNext(
-                            PutResponse.newBuilder().setVersion(stored.version()).build());
-                    responseObserver.onCompleted();
-                } catch (RuntimeException e) {
-                    responseObserver.onError(
-                            Status.UNAVAILABLE.withDescription(e.getMessage()).asRuntimeException());
-                }
-                return;
-            }
             long nextVersion = currentVersion(request.getKey()) + 1;
             StoredValue value = new StoredValue(
                     request.getValue().toByteArray(),

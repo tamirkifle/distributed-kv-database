@@ -59,7 +59,7 @@ public final class LeaderlessKVCluster {
     }
 
     public List<ClusterNode> selectReplicas(String key) {
-        return membership.getPreferenceList(key, membership.getReplicationFactor());
+        return membership.selectReplicas(key);
     }
 
     public Optional<VersionedValue> getReplicaValue(String nodeId, String key) {
