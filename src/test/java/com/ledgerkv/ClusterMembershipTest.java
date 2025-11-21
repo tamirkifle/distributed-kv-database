@@ -28,21 +28,29 @@ class ClusterMembershipTest {
     void selectsDeterministicReplicaSetForKey() {
         ClusterMembership membership = ClusterMembership.create("test-cluster", 5, 3);
 
-        List<ClusterNode> firstSelection = membership.selectReplicas("trace:run-001");
-        List<ClusterNode> secondSelection = membership.selectReplicas("trace:run-001");
-        List<ClusterNode> differentKeySelection = membership.selectReplicas("trace:run-002");
+        List<ClusterNode> firstSelection = membership.getPreferenceList("trace:run-001", 3);
+        List<ClusterNode> secondSelection = membership.getPreferenceList("trace:run-001", 3);
 
         assertEquals(3, firstSelection.size());
         assertEquals(firstSelection, secondSelection, "Replica selection should be stable for a key");
-        assertNotEquals(firstSelection, differentKeySelection,
-            "Different keys should be able to map to different replica sets");
+
+        // Across a key sample, the ring must produce more than one distinct preference list
+        // (otherwise placement is degenerate / not key-dependent).
+        java.util.Set<List<String>> distinctSets = new java.util.HashSet<>();
+        for (int i = 0; i < 200; i++) {
+            distinctSets.add(membership.getPreferenceList("trace:run-" + i, 3).stream()
+                .map(ClusterNode::getId)
+                .collect(java.util.stream.Collectors.toList()));
+        }
+        assertTrue(distinctSets.size() > 1,
+            "Different keys should map to different replica sets");
     }
 
     @Test
     void wrapsReplicaSelectionAroundNodeRing() {
         ClusterMembership membership = ClusterMembership.create("cluster", 3, 3);
 
-        List<ClusterNode> replicas = membership.selectReplicas("key-near-end-of-ring");
+        List<ClusterNode> replicas = membership.getPreferenceList("key-near-end-of-ring", 3);
 
         assertEquals(3, replicas.size());
         assertEquals(3, replicas.stream().map(ClusterNode::getId).distinct().count(),
@@ -56,6 +64,6 @@ class ClusterMembershipTest {
         assertThrows(IllegalArgumentException.class, () -> ClusterMembership.create("cluster", 3, 0));
         assertThrows(IllegalArgumentException.class, () -> ClusterMembership.create("cluster", 3, 4));
         assertThrows(IllegalArgumentException.class,
-            () -> ClusterMembership.create("cluster", 3, 2).selectReplicas(""));
+            () -> ClusterMembership.create("cluster", 3, 2).getPreferenceList("", 2));
     }
 }

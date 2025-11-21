@@ -45,7 +45,8 @@ class RandomizedFailureHistoryTest {
         );
         OperationHistoryRecorder recorder = new OperationHistoryRecorder();
 
-        List<ScenarioStep> steps = scenarioFor(SEED, membership.selectReplicas(KEY));
+        List<ScenarioStep> steps = scenarioFor(SEED,
+            membership.getPreferenceList(KEY, membership.getReplicationFactor()));
         for (int i = 0; i < steps.size(); i++) {
             runStep(cluster, recorder, weakConfig, failures, steps.get(i), i);
         }

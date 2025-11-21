@@ -1,0 +1,59 @@
+{
+  "title": "LedgerKV Cluster",
+  "uid": "ledgerkv-cluster",
+  "schemaVersion": 39,
+  "timezone": "browser",
+  "refresh": "5s",
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Operations / sec (by node)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "ledgerkv-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "rate(ledgerkv_operations_total[1m])", "legendFormat": "{{node}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "p99 operation latency (ms)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "ledgerkv-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "ledgerkv_operation_latency_ms{quantile=\"0.99\"}",
+          "legendFormat": "{{node}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Quorum failures (rate)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "ledgerkv-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(ledgerkv_quorum_failure_total[1m])",
+          "legendFormat": "{{node}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Repairs performed",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "ledgerkv-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "refId": "A", "expr": "ledgerkv_repairs_total", "legendFormat": "{{node}}" }
+      ]
+    }
+  ]
+}

@@ -34,7 +34,7 @@ public final class OperationMetricsCollector {
             if (response.isSuccessful() && response.hasConflicts()) {
                 conflictCount++;
             }
-            latencySamplesMs.add(response.getLatencyMs());
+            recordLatency(response);
         }
     }
 
@@ -44,8 +44,19 @@ public final class OperationMetricsCollector {
             operationCount++;
             writeCount++;
             recordOutcome(response);
-            latencySamplesMs.add(response.getLatencyMs());
+            recordLatency(response);
         }
+    }
+
+    /**
+     * Records the operation's latency, clamping at zero. Quorum durations are measured with a
+     * monotonic clock, but a defensive clamp here guarantees a stray non-monotonic sample (e.g. a
+     * backward wall-clock step from a legacy caller) can never poison the {@code /metrics} endpoint:
+     * {@link OperationMetrics} and {@link LatencySummary} reject negative samples, so an unclamped
+     * value would make every scrape throw forever.
+     */
+    private void recordLatency(QuorumResponse response) {
+        latencySamplesMs.add(Math.max(0L, response.getLatencyMs()));
     }
 
     public OperationMetrics snapshot() {
