@@ -51,4 +51,19 @@ public class OperationMetricsCollectorTest {
 
         assertEquals(List.of(7L, 3L), collector.snapshot().getLatencySamplesMs());
     }
+
+    @Test
+    public void accumulatesHedgedRequestCount() {
+        OperationMetricsCollector collector = new OperationMetricsCollector();
+        collector.recordHedges(1);
+        collector.recordHedges(2);
+        assertEquals(3, collector.snapshot().getHedgedRequestCount());
+    }
+
+    @Test
+    public void clampsNegativeHedgeDeltaToZero() {
+        OperationMetricsCollector collector = new OperationMetricsCollector();
+        collector.recordHedges(-5);
+        assertEquals(0, collector.snapshot().getHedgedRequestCount());
+    }
 }

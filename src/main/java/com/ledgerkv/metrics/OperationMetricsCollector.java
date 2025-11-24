@@ -20,6 +20,7 @@ public final class OperationMetricsCollector {
     private long quorumFailureCount;
     private long staleReadCount;
     private long conflictCount;
+    private long hedgedRequestCount;
     private final List<Long> latencySamplesMs = new ArrayList<>();
 
     public void recordRead(QuorumResponse response) {
@@ -59,6 +60,17 @@ public final class OperationMetricsCollector {
         latencySamplesMs.add(Math.max(0L, response.getLatencyMs()));
     }
 
+    /**
+     * Records that {@code delta} backup (hedge) requests fired during one operation. Clamps a negative
+     * delta to zero — same defensive discipline as {@link #recordLatency}, so a caller that computes a
+     * spurious negative (e.g. a counter that wrapped) can never make {@link OperationMetrics} throw.
+     */
+    public void recordHedges(long delta) {
+        synchronized (lock) {
+            hedgedRequestCount += Math.max(0L, delta);
+        }
+    }
+
     public OperationMetrics snapshot() {
         synchronized (lock) {
             return new OperationMetrics(
@@ -70,6 +82,7 @@ public final class OperationMetricsCollector {
                 quorumFailureCount,
                 staleReadCount,
                 conflictCount,
+                hedgedRequestCount,
                 latencySamplesMs
             );
         }
