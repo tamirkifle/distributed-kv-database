@@ -42,12 +42,6 @@ public final class RaftLog {
         return entries.get((int) (index - 1));
     }
 
-    /** Bulk-replace the log with a dense, 1-based-indexed list (recovery path). */
-    public void replace(List<LogEntry> recovered) {
-        entries.clear();
-        entries.addAll(recovered);
-    }
-
     public void append(LogEntry entry) {
         Objects.requireNonNull(entry, "entry");
         if (entry.index() != lastIndex() + 1) {

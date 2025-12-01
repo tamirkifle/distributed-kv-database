@@ -2,7 +2,6 @@ package com.ledgerkv.node;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -26,12 +25,11 @@ public final class NodeConfig {
     private final int replicationFactor;
     private final int writeQuorum;
     private final int readQuorum;
-    private final int requestDeadlineMillis;
     private final List<String> peers;
 
     private NodeConfig(String clusterId, int nodeIndex, int nodeCount, int grpcPort, int healthPort,
                        Path dataDir, int replicationFactor, int writeQuorum, int readQuorum,
-                       int requestDeadlineMillis, List<String> peers) {
+                       List<String> peers) {
         this.clusterId = clusterId;
         this.nodeIndex = nodeIndex;
         this.nodeCount = nodeCount;
@@ -41,7 +39,6 @@ public final class NodeConfig {
         this.replicationFactor = replicationFactor;
         this.writeQuorum = writeQuorum;
         this.readQuorum = readQuorum;
-        this.requestDeadlineMillis = requestDeadlineMillis;
         this.peers = Collections.unmodifiableList(peers);
     }
 
@@ -56,7 +53,6 @@ public final class NodeConfig {
         int replicationFactor = intOrDefault(env, "LEDGERKV_REPLICATION_FACTOR", 3);
         int writeQuorum = intOrDefault(env, "LEDGERKV_WRITE_QUORUM", 2);
         int readQuorum = intOrDefault(env, "LEDGERKV_READ_QUORUM", 2);
-        int requestDeadlineMillis = intOrDefault(env, "LEDGERKV_REQUEST_DEADLINE_MS", 5000);
 
         if (peers.size() != nodeCount) {
             throw new IllegalArgumentException(
@@ -67,7 +63,7 @@ public final class NodeConfig {
                     "node index " + nodeIndex + " is out of range [0, " + nodeCount + ")");
         }
         return new NodeConfig(clusterId, nodeIndex, nodeCount, grpcPort, healthPort, dataDir,
-                replicationFactor, writeQuorum, readQuorum, requestDeadlineMillis, peers);
+                replicationFactor, writeQuorum, readQuorum, peers);
     }
 
     public String clusterId() { return clusterId; }
@@ -79,7 +75,6 @@ public final class NodeConfig {
     public int replicationFactor() { return replicationFactor; }
     public int writeQuorum() { return writeQuorum; }
     public int readQuorum() { return readQuorum; }
-    public Duration requestDeadline() { return Duration.ofMillis(requestDeadlineMillis); }
     public List<String> peers() { return peers; }
 
     public String nodeId() { return clusterId + "-node-" + nodeIndex; }

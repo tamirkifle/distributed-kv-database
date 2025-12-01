@@ -215,9 +215,7 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
         }
         List<SSTableHandle> pinned = pinnedSnapshot();
         for (SSTableHandle h : pinned) {
-            // Block-skip via the sparse index: only blocks covering [from, to) are read.
-            // The BoundedIterator still applies the exact per-key bound; this narrows IO.
-            runs.add(h.table().rangeScan(fromInclusive, toExclusive));
+            runs.add(h.table().iterator());
         }
         // dropTombstones=true: the merge resolves newest-wins, so a winning tombstone means the
         // key is deleted and is correctly omitted from the live scan view.
