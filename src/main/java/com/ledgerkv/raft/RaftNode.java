@@ -148,4 +148,106 @@ public final class RaftNode {
         electionElapsed = 0;
         electionTimeout = electionTimeoutSource.getAsInt();
     }
+
+    private static final int HEARTBEAT_INTERVAL = 1;
+    private int heartbeatElapsed = 0;
+
+    public void registerPeer(RaftPeer peer) {
+        peers.put(peer.nodeId(), peer);
+    }
+
+    public boolean isLeader() {
+        return role == RaftRole.LEADER;
+    }
+
+    public synchronized void tick() {
+        if (role == RaftRole.LEADER) {
+            heartbeatElapsed++;
+            if (heartbeatElapsed >= HEARTBEAT_INTERVAL) {
+                heartbeatElapsed = 0;
+                sendHeartbeats();
+            }
+            return;
+        }
+        electionElapsed++;
+        if (electionElapsed >= electionTimeout) {
+            startElection();
+        }
+    }
+
+    private void startElection() {
+        role = RaftRole.CANDIDATE;
+        currentTerm++;
+        votedFor = nodeId;
+        votesReceived.clear();
+        votesReceived.add(nodeId);
+        resetElectionTimer();
+
+        RequestVoteRequest req =
+                RequestVoteRequest.of(currentTerm, nodeId, log.lastIndex(), log.lastTerm());
+        for (RaftPeer peer : peers.values()) {
+            try {
+                RequestVoteResponse resp = peer.requestVote(req);
+                if (resp.term() > currentTerm) {
+                    stepDown(resp.term());
+                    return;
+                }
+                if (resp.term() == currentTerm && resp.voteGranted()) {
+                    votesReceived.add(peer.nodeId());
+                }
+            } catch (RuntimeException unreachable) {
+                // dropped RequestVote: no vote from this peer.
+            }
+        }
+        if (role == RaftRole.CANDIDATE && hasMajority(votesReceived.size())) {
+            becomeLeader();
+        }
+    }
+
+    private boolean hasMajority(int votes) {
+        int clusterSize = peerIds.size() + 1;
+        return votes > clusterSize / 2;
+    }
+
+    private void becomeLeader() {
+        role = RaftRole.LEADER;
+        heartbeatElapsed = HEARTBEAT_INTERVAL; // send a heartbeat promptly
+        nextIndex.clear();
+        matchIndex.clear();
+        for (String peerId : peerIds) {
+            nextIndex.put(peerId, log.lastIndex() + 1);
+            matchIndex.put(peerId, 0L);
+        }
+        sendHeartbeats();
+    }
+
+    private void sendHeartbeats() {
+        for (RaftPeer peer : peers.values()) {
+            replicateTo(peer);
+        }
+    }
+
+    private void replicateTo(RaftPeer peer) {
+        long ni = nextIndex.getOrDefault(peer.nodeId(), log.lastIndex() + 1);
+        long prevLogIndex = ni - 1;
+        long prevLogTerm = log.termAt(prevLogIndex);
+        List<LogEntry> entries = log.from(ni);
+        AppendEntriesRequest req = AppendEntriesRequest.of(
+                currentTerm, nodeId, prevLogIndex, prevLogTerm, entries, commitIndex);
+        try {
+            AppendEntriesResponse resp = peer.appendEntries(req);
+            if (resp.term() > currentTerm) {
+                stepDown(resp.term());
+                return;
+            }
+            if (resp.success()) {
+                matchIndex.put(peer.nodeId(), resp.matchIndex());
+                nextIndex.put(peer.nodeId(), resp.matchIndex() + 1);
+            } else {
+                nextIndex.put(peer.nodeId(), Math.max(1, resp.conflictIndex()));
+            }
+        } catch (RuntimeException unreachable) {
+            // dropped AppendEntries: retry on the next heartbeat.
+        }
+    }
 }
