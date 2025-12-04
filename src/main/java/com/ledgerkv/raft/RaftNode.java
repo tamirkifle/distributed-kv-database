@@ -243,11 +243,53 @@ public final class RaftNode {
             if (resp.success()) {
                 matchIndex.put(peer.nodeId(), resp.matchIndex());
                 nextIndex.put(peer.nodeId(), resp.matchIndex() + 1);
+                advanceCommitIndex();
             } else {
                 nextIndex.put(peer.nodeId(), Math.max(1, resp.conflictIndex()));
             }
         } catch (RuntimeException unreachable) {
             // dropped AppendEntries: retry on the next heartbeat.
+        }
+    }
+
+    public long lastApplied() {
+        return lastApplied;
+    }
+
+    public synchronized boolean propose(byte[] command) {
+        if (role != RaftRole.LEADER) {
+            return false;
+        }
+        long index = log.lastIndex() + 1;
+        log.append(LogEntry.of(currentTerm, index, command));
+        matchIndex.put(nodeId, index); // leader trivially has it
+        sendHeartbeats();
+        advanceCommitIndex();
+        return true;
+    }
+
+    /**
+     * Recompute commitIndex from the majority matchIndex, honoring the Raft §5.4.2 rule: a leader
+     * only commits entries from its current term via match-count (older-term entries commit only
+     * indirectly, once a current-term entry above them commits).
+     */
+    private void advanceCommitIndex() {
+        int clusterSize = peerIds.size() + 1;
+        for (long candidate = log.lastIndex(); candidate > commitIndex; candidate--) {
+            if (log.termAt(candidate) != currentTerm) {
+                continue; // never commit a prior-term entry by match-count alone
+            }
+            int replicas = 1; // leader itself
+            for (String peerId : peerIds) {
+                if (matchIndex.getOrDefault(peerId, 0L) >= candidate) {
+                    replicas++;
+                }
+            }
+            if (replicas > clusterSize / 2) {
+                commitIndex = candidate;
+                applyCommitted();
+                break;
+            }
         }
     }
 }
