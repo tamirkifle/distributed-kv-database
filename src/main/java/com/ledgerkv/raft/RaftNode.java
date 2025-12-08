@@ -48,13 +48,33 @@ public final class RaftNode {
     private final Map<String, Long> matchIndex = new HashMap<>();
     private final Map<String, RaftPeer> peers = new HashMap<>();
 
+    // Durable persistence sink (nullable: in-memory mode for 3a tests).
+    private final RaftPersistence persistence;
+
     public RaftNode(String nodeId, List<String> peerIds, StateMachine stateMachine,
             IntSupplier electionTimeoutSource) {
+        this(nodeId, peerIds, stateMachine, electionTimeoutSource, null,
+                new RaftState(0, null, java.util.Collections.emptyList()));
+    }
+
+    public RaftNode(String nodeId, List<String> peerIds, StateMachine stateMachine,
+            IntSupplier electionTimeoutSource, RaftPersistence persistence, RaftState recovered) {
         this.nodeId = Objects.requireNonNull(nodeId, "nodeId");
         this.peerIds = new ArrayList<>(Objects.requireNonNull(peerIds, "peerIds"));
         this.stateMachine = Objects.requireNonNull(stateMachine, "stateMachine");
         this.electionTimeoutSource = Objects.requireNonNull(electionTimeoutSource, "electionTimeoutSource");
         this.electionTimeout = electionTimeoutSource.getAsInt();
+        this.persistence = persistence;
+        this.currentTerm = recovered.currentTerm();
+        this.votedFor = recovered.votedFor();
+        this.log.replace(recovered.entries());
+    }
+
+    /** Closes the durable persistence handle if any (no-op in in-memory mode). */
+    public void closePersistence() throws java.io.IOException {
+        if (persistence != null) {
+            persistence.close();
+        }
     }
 
     public String nodeId() {
@@ -91,6 +111,7 @@ public final class RaftNode {
                 && candidateLogIsUpToDate(req.lastLogIndex(), req.lastLogTerm())) {
             grant = true;
             votedFor = req.candidateId();
+            persistVote();
             resetElectionTimer();
         }
         return RequestVoteResponse.of(currentTerm, grant);
@@ -112,7 +133,7 @@ public final class RaftNode {
             return AppendEntriesResponse.failure(currentTerm, conflict);
         }
 
-        log.appendAll(req.prevLogIndex(), req.entries());
+        persistAppend(req.prevLogIndex(), req.entries());
 
         if (req.leaderCommit() > commitIndex) {
             commitIndex = Math.min(req.leaderCommit(), log.lastIndex());
@@ -135,6 +156,7 @@ public final class RaftNode {
         role = RaftRole.FOLLOWER;
         votedFor = null;
         votesReceived.clear();
+        persistTerm();
     }
 
     private void applyCommitted() {
@@ -179,6 +201,7 @@ public final class RaftNode {
         role = RaftRole.CANDIDATE;
         currentTerm++;
         votedFor = nodeId;
+        persistTerm();
         votesReceived.clear();
         votesReceived.add(nodeId);
         resetElectionTimer();
@@ -262,6 +285,7 @@ public final class RaftNode {
         }
         long index = log.lastIndex() + 1;
         log.append(LogEntry.of(currentTerm, index, command));
+        persistEntry(log.entryAt(index));
         matchIndex.put(nodeId, index); // leader trivially has it
         sendHeartbeats();
         advanceCommitIndex();
@@ -290,6 +314,71 @@ public final class RaftNode {
                 applyCommitted();
                 break;
             }
+        }
+    }
+
+    /**
+     * Merge a leader's entries while persisting them durably first: a divergent suffix writes a
+     * TRUNCATE record before the in-memory truncation, then every entry in the resulting suffix is
+     * recorded. Re-recording identical entries is idempotent on replay (overwrite at the same index),
+     * which keeps this simple and crash-correct without per-entry diffing (YAGNI).
+     */
+    private void persistAppend(long prevLogIndex, List<LogEntry> incoming) {
+        if (persistence != null) {
+            long index = prevLogIndex + 1;
+            for (LogEntry entry : incoming) {
+                if (log.hasEntryAt(index) && log.termAt(index) != entry.term()) {
+                    try {
+                        persistence.recordTruncate(index);
+                    } catch (java.io.IOException e) {
+                        throw new RuntimeException("raft persistence failed", e);
+                    }
+                }
+                index++;
+            }
+        }
+        log.appendAll(prevLogIndex, incoming);
+        if (persistence != null) {
+            for (long i = prevLogIndex + 1; i <= log.lastIndex(); i++) {
+                try {
+                    persistence.recordEntry(log.entryAt(i));
+                } catch (java.io.IOException e) {
+                    throw new RuntimeException("raft persistence failed", e);
+                }
+            }
+        }
+    }
+
+    private void persistTerm() {
+        if (persistence == null) {
+            return;
+        }
+        try {
+            persistence.recordTerm(currentTerm, votedFor);
+        } catch (java.io.IOException e) {
+            throw new RuntimeException("raft persistence failed", e);
+        }
+    }
+
+    private void persistVote() {
+        if (persistence == null) {
+            return;
+        }
+        try {
+            persistence.recordVote(votedFor);
+        } catch (java.io.IOException e) {
+            throw new RuntimeException("raft persistence failed", e);
+        }
+    }
+
+    private void persistEntry(LogEntry entry) {
+        if (persistence == null) {
+            return;
+        }
+        try {
+            persistence.recordEntry(entry);
+        } catch (java.io.IOException e) {
+            throw new RuntimeException("raft persistence failed", e);
         }
     }
 }
