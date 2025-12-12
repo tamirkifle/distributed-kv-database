@@ -64,7 +64,8 @@ class RaftReplicationTest {
         List<String> ids = Arrays.asList("n0", "n1", "n2");
         RaftNode leader = electLeader("n0", ids);
 
-        assertTrue(leader.propose("set x=1".getBytes()));
+        long index = leader.propose("set x=1".getBytes());
+        assertEquals(1, index);
         assertEquals(1, leader.commitIndex());
         assertEquals(Arrays.asList("set x=1"), recorders.get("n0").applied);
 
@@ -79,7 +80,7 @@ class RaftReplicationTest {
         List<String> ids = Arrays.asList("n0", "n1", "n2");
         electLeader("n0", ids);
         RaftNode follower = nodes.get("n1");
-        assertFalse(follower.propose("nope".getBytes()));
+        assertEquals(0, follower.propose("nope".getBytes()));
         assertEquals(0, follower.log().lastIndex());
     }
 

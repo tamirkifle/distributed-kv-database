@@ -279,9 +279,14 @@ public final class RaftNode {
         return lastApplied;
     }
 
-    public synchronized boolean propose(byte[] command) {
+    /**
+     * Append a command to the leader's log and replicate it. Returns the assigned 1-based log
+     * index (so a caller can wait for {@link #lastApplied()} {@code >= index}), or {@code 0} if
+     * this node is not the leader.
+     */
+    public synchronized long propose(byte[] command) {
         if (role != RaftRole.LEADER) {
-            return false;
+            return 0;
         }
         long index = log.lastIndex() + 1;
         log.append(LogEntry.of(currentTerm, index, command));
@@ -289,7 +294,7 @@ public final class RaftNode {
         matchIndex.put(nodeId, index); // leader trivially has it
         sendHeartbeats();
         advanceCommitIndex();
-        return true;
+        return index;
     }
 
     /**

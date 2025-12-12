@@ -25,7 +25,7 @@ class RaftGrpcGroupTest {
             assertTrue(cluster.node("n0").isLeader());
 
             // Replicate a command over real gRPC; heartbeats carry the commit to followers.
-            assertTrue(cluster.node("n0").propose("set k=1".getBytes()));
+            assertTrue(cluster.node("n0").propose("set k=1".getBytes()) > 0);
             cluster.tickLeader("n0", 3);
             assertEquals(List.of("set k=1"), cluster.appliedAt("n1"));
             assertEquals(List.of("set k=1"), cluster.appliedAt("n2"));
@@ -36,7 +36,7 @@ class RaftGrpcGroupTest {
             assertEquals("n1", newLeader);
 
             // A fresh write commits on the surviving majority {n1, n2}.
-            assertTrue(cluster.node("n1").propose("set k=2".getBytes()));
+            assertTrue(cluster.node("n1").propose("set k=2".getBytes()) > 0);
             cluster.tickLeader("n1", 3);
             assertEquals(List.of("set k=1", "set k=2"), cluster.appliedAt("n2"));
         }
