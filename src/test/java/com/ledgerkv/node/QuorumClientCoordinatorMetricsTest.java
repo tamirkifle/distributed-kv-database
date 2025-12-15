@@ -64,6 +64,37 @@ class QuorumClientCoordinatorMetricsTest {
         assertEquals(1, metrics.getQuorumFailureCount());
     }
 
+    @Test
+    void recordsHedgedRequestCountFromCluster() {
+        ClusterMembership membership = ClusterMembership.create("ledgerkv", 4, 3);
+        Map<String, ReplicaClient> replicas = new LinkedHashMap<>();
+        for (int i = 0; i < 4; i++) {
+            String nodeId = "ledgerkv-node-" + i;
+            replicas.put(nodeId, new InMemoryReplicaClient(nodeId));
+        }
+        // Block one primary for the chosen key so a hedge to the 4th node is needed for W=3.
+        String key = "k";
+        java.util.List<com.ledgerkv.quorum.ClusterNode> prefs =
+            membership.getPreferenceList(key, 4);
+        String slowId = prefs.get(2).getId();
+        com.ledgerkv.quorum.LatchControlledReplicaClient slow =
+            new com.ledgerkv.quorum.LatchControlledReplicaClient(replicas.get(slowId));
+        replicas.put(slowId, slow);
+
+        java.util.concurrent.ExecutorService pool =
+            java.util.concurrent.Executors.newCachedThreadPool();
+        LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
+            membership, new QuorumConfig(3, 3, 2), replicas, pool,
+            java.time.Duration.ofSeconds(2), java.time.Duration.ofMillis(20));
+        QuorumClientCoordinator coordinator = new QuorumClientCoordinator(cluster, 0);
+
+        coordinator.put(key, "v".getBytes(StandardCharsets.UTF_8));
+
+        assertEquals(1, coordinator.operationMetrics().getHedgedRequestCount());
+        slow.release();
+        pool.shutdownNow();
+    }
+
     private static ReplicaClient failing(String nodeId) {
         return new ReplicaClient() {
             @Override

@@ -40,6 +40,9 @@ public final class PrometheusExporter {
             node, ops.getStaleReadCount());
         counter(sb, "ledgerkv_conflict_total", "Successful reads that observed conflicting values.",
             node, ops.getConflictCount());
+        counter(sb, "ledgerkv_hedged_requests_total",
+            "Backup (hedge) requests fired to tame tail latency.", node,
+            ops.getHedgedRequestCount());
 
         sb.append("# HELP ledgerkv_operation_latency_ms Quorum operation latency quantiles (ms).\n");
         sb.append("# TYPE ledgerkv_operation_latency_ms gauge\n");

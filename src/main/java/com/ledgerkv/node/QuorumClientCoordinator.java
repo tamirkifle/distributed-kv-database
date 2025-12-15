@@ -34,8 +34,10 @@ public final class QuorumClientCoordinator implements ClientCoordinator {
 
     @Override
     public Optional<StoredValue> get(String key) {
+        long hedgesBefore = cluster.hedgedRequestCount();
         QuorumResponse response = cluster.read(coordinatorIndex, key);
         metricsCollector.recordRead(response);
+        metricsCollector.recordHedges(cluster.hedgedRequestCount() - hedgesBefore);
         if (!response.isSuccessful()) {
             throw new IllegalStateException("read quorum not met for key " + key);
         }
@@ -48,9 +50,11 @@ public final class QuorumClientCoordinator implements ClientCoordinator {
 
     @Override
     public StoredValue put(String key, byte[] value) {
+        long hedgesBefore = cluster.hedgedRequestCount();
         String asString = new String(value, StandardCharsets.UTF_8);
         QuorumResponse response = cluster.write(coordinatorIndex, key, asString);
         metricsCollector.recordWrite(response);
+        metricsCollector.recordHedges(cluster.hedgedRequestCount() - hedgesBefore);
         if (!response.isSuccessful()) {
             throw new IllegalStateException("write quorum not met for key " + key);
         }
