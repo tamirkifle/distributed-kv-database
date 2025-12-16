@@ -24,6 +24,7 @@ public final class RaftPersistence implements Closeable {
     private static final byte VOTE = 2;
     private static final byte ENTRY = 3;
     private static final byte TRUNCATE = 4;
+    private static final byte SNAPSHOT = 5;
 
     private final WriteAheadLog wal;
 
@@ -63,6 +64,22 @@ public final class RaftPersistence implements Closeable {
         wal.append(buf.array());
     }
 
+    /**
+     * Append a snapshot record (one on-disk format: opaque WAL payload tagged SNAPSHOT). The leader
+     * also truncates its in-memory log prefix; on replay this record sets the recovered base and
+     * discards entries it covers.
+     */
+    public void recordSnapshot(Snapshot snapshot) throws IOException {
+        byte[] data = snapshot.data();
+        ByteBuffer buf = ByteBuffer.allocate(1 + 8 + 8 + 4 + data.length);
+        buf.put(SNAPSHOT)
+                .putLong(snapshot.lastIncludedIndex())
+                .putLong(snapshot.lastIncludedTerm())
+                .putInt(data.length)
+                .put(data);
+        wal.append(buf.array());
+    }
+
     @Override
     public void close() throws IOException {
         wal.close();
@@ -72,6 +89,7 @@ public final class RaftPersistence implements Closeable {
         long[] term = {0};
         String[] votedFor = {null};
         List<LogEntry> entries = new ArrayList<>();
+        Snapshot[] snapshot = {null};
         WriteAheadLog.replayBytes(dir.resolve("raft.wal"), payload -> {
             ByteBuffer buf = ByteBuffer.wrap(payload);
             byte kind = buf.get();
@@ -107,10 +125,22 @@ public final class RaftPersistence implements Closeable {
                     }
                     break;
                 }
+                case SNAPSHOT: {
+                    long lastIncludedIndex = buf.getLong();
+                    long lastIncludedTerm = buf.getLong();
+                    byte[] data = new byte[buf.getInt()];
+                    buf.get(data);
+                    snapshot[0] = Snapshot.of(lastIncludedIndex, lastIncludedTerm, data);
+                    // Drop any replayed entries the snapshot now covers.
+                    while (!entries.isEmpty() && entries.get(0).index() <= lastIncludedIndex) {
+                        entries.remove(0);
+                    }
+                    break;
+                }
                 default:
                     throw new IllegalStateException("unknown raft record kind " + kind);
             }
         });
-        return new RaftState(term[0], votedFor[0], entries);
+        return new RaftState(term[0], votedFor[0], entries, snapshot[0]);
     }
 }
