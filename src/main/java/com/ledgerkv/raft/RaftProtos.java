@@ -71,6 +71,31 @@ public final class RaftProtos {
                 : AppendEntriesResponse.failure(p.getTerm(), p.getConflictIndex());
     }
 
+    public static com.ledgerkv.transport.proto.InstallSnapshotRequest toProto(InstallSnapshotRequest r) {
+        return com.ledgerkv.transport.proto.InstallSnapshotRequest.newBuilder()
+                .setTerm(r.term())
+                .setLeaderId(r.leaderId())
+                .setLastIncludedIndex(r.lastIncludedIndex())
+                .setLastIncludedTerm(r.lastIncludedTerm())
+                .setData(ByteString.copyFrom(r.data()))
+                .build();
+    }
+
+    public static InstallSnapshotRequest fromProto(com.ledgerkv.transport.proto.InstallSnapshotRequest p) {
+        return InstallSnapshotRequest.of(p.getTerm(), p.getLeaderId(), p.getLastIncludedIndex(),
+                p.getLastIncludedTerm(), p.getData().toByteArray());
+    }
+
+    public static com.ledgerkv.transport.proto.InstallSnapshotResponse toProto(InstallSnapshotResponse r) {
+        return com.ledgerkv.transport.proto.InstallSnapshotResponse.newBuilder()
+                .setTerm(r.term())
+                .build();
+    }
+
+    public static InstallSnapshotResponse fromProto(com.ledgerkv.transport.proto.InstallSnapshotResponse p) {
+        return InstallSnapshotResponse.of(p.getTerm());
+    }
+
     public static com.ledgerkv.transport.proto.RaftLogEntry toProto(LogEntry e) {
         return com.ledgerkv.transport.proto.RaftLogEntry.newBuilder()
                 .setTerm(e.term())

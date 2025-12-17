@@ -28,6 +28,10 @@ public final class RaftClient implements AutoCloseable {
         return RaftProtos.fromProto(stub.appendEntries(RaftProtos.toProto(request)));
     }
 
+    public InstallSnapshotResponse installSnapshot(InstallSnapshotRequest request) {
+        return RaftProtos.fromProto(stub.installSnapshot(RaftProtos.toProto(request)));
+    }
+
     @Override
     public void close() throws InterruptedException {
         channel.shutdown();

@@ -32,4 +32,9 @@ public final class GrpcRaftPeer implements RaftPeer {
     public AppendEntriesResponse appendEntries(AppendEntriesRequest request) {
         return client.appendEntries(request);
     }
+
+    @Override
+    public InstallSnapshotResponse installSnapshot(InstallSnapshotRequest request) {
+        return client.installSnapshot(request);
+    }
 }

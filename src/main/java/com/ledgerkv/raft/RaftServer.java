@@ -59,5 +59,12 @@ public final class RaftServer implements AutoCloseable {
             obs.onNext(RaftProtos.toProto(node.handleAppendEntries(RaftProtos.fromProto(request))));
             obs.onCompleted();
         }
+
+        @Override
+        public void installSnapshot(com.ledgerkv.transport.proto.InstallSnapshotRequest request,
+                StreamObserver<com.ledgerkv.transport.proto.InstallSnapshotResponse> obs) {
+            obs.onNext(RaftProtos.toProto(node.handleInstallSnapshot(RaftProtos.fromProto(request))));
+            obs.onCompleted();
+        }
     }
 }
