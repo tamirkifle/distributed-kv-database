@@ -51,9 +51,6 @@ public final class RaftNode {
     // Durable persistence sink (nullable: in-memory mode for 3a tests).
     private final RaftPersistence persistence;
 
-    // Log-compaction trigger (injectable): compact once this many physical applied entries pile up.
-    private int compactionThreshold = Integer.MAX_VALUE; // never auto-compacts by default
-
     public RaftNode(String nodeId, List<String> peerIds, StateMachine stateMachine,
             IntSupplier electionTimeoutSource) {
         this(nodeId, peerIds, stateMachine, electionTimeoutSource, null,
@@ -70,20 +67,7 @@ public final class RaftNode {
         this.persistence = persistence;
         this.currentTerm = recovered.currentTerm();
         this.votedFor = recovered.votedFor();
-        Snapshot recoveredSnapshot = recovered.snapshot();
-        if (recoveredSnapshot != null) {
-            // Set the log base from the snapshot, load the recovered tail above it, restore the
-            // state machine, and mark everything through the base committed+applied.
-            this.log.resetToSnapshot(recoveredSnapshot.lastIncludedIndex(),
-                    recoveredSnapshot.lastIncludedTerm());
-            this.log.replace(recovered.entries());
-            this.stateMachine.restore(recoveredSnapshot.data(),
-                    recoveredSnapshot.lastIncludedIndex(), recoveredSnapshot.lastIncludedTerm());
-            this.commitIndex = recoveredSnapshot.lastIncludedIndex();
-            this.lastApplied = recoveredSnapshot.lastIncludedIndex();
-        } else {
-            this.log.replace(recovered.entries());
-        }
+        this.log.replace(recovered.entries());
     }
 
     /** Closes the durable persistence handle if any (no-op in in-memory mode). */
@@ -156,41 +140,6 @@ public final class RaftNode {
             applyCommitted();
         }
         return AppendEntriesResponse.success(currentTerm, log.lastIndex());
-    }
-
-    /**
-     * Follower side of InstallSnapshot (Raft §7): a leader ships a snapshot when the entries this
-     * follower needs have been compacted away. Reject a stale term; otherwise discard the local log
-     * (replaced by the snapshot), restore the state machine, advance commit/applied to the base, and
-     * persist the snapshot. Idempotent: a snapshot we already cover is ignored.
-     */
-    public synchronized InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest req) {
-        if (req.term() < currentTerm) {
-            return InstallSnapshotResponse.of(currentTerm);
-        }
-        if (req.term() > currentTerm) {
-            stepDown(req.term());
-        }
-        role = RaftRole.FOLLOWER;
-        resetElectionTimer();
-
-        if (req.lastIncludedIndex() <= log.lastIncludedIndex()) {
-            return InstallSnapshotResponse.of(currentTerm); // already covered
-        }
-
-        log.resetToSnapshot(req.lastIncludedIndex(), req.lastIncludedTerm());
-        stateMachine.restore(req.data(), req.lastIncludedIndex(), req.lastIncludedTerm());
-        commitIndex = req.lastIncludedIndex();
-        lastApplied = req.lastIncludedIndex();
-        if (persistence != null) {
-            try {
-                persistence.recordSnapshot(
-                        Snapshot.of(req.lastIncludedIndex(), req.lastIncludedTerm(), req.data()));
-            } catch (java.io.IOException e) {
-                throw new RuntimeException("raft persistence failed", e);
-            }
-        }
-        return InstallSnapshotResponse.of(currentTerm);
     }
 
     private boolean candidateLogIsUpToDate(long lastLogIndex, long lastLogTerm) {
@@ -303,11 +252,6 @@ public final class RaftNode {
 
     private void replicateTo(RaftPeer peer) {
         long ni = nextIndex.getOrDefault(peer.nodeId(), log.lastIndex() + 1);
-        if (ni <= log.lastIncludedIndex()) {
-            // The entries this follower needs are compacted away — ship the snapshot instead.
-            sendSnapshot(peer);
-            return;
-        }
         long prevLogIndex = ni - 1;
         long prevLogTerm = log.termAt(prevLogIndex);
         List<LogEntry> entries = log.from(ni);
@@ -331,58 +275,8 @@ public final class RaftNode {
         }
     }
 
-    private void sendSnapshot(RaftPeer peer) {
-        long base = log.lastIncludedIndex();
-        InstallSnapshotRequest req = InstallSnapshotRequest.of(
-                currentTerm, nodeId, base, log.lastIncludedTerm(), stateMachine.snapshot());
-        try {
-            InstallSnapshotResponse resp = peer.installSnapshot(req);
-            if (resp.term() > currentTerm) {
-                stepDown(resp.term());
-                return;
-            }
-            matchIndex.put(peer.nodeId(), base);
-            nextIndex.put(peer.nodeId(), base + 1);
-            advanceCommitIndex();
-        } catch (RuntimeException unreachable) {
-            // dropped InstallSnapshot: retry on the next heartbeat.
-        }
-    }
-
     public long lastApplied() {
         return lastApplied;
-    }
-
-    /** Injectable compaction trigger: compact once this many physical applied entries accumulate. */
-    void setCompactionThreshold(int threshold) {
-        this.compactionThreshold = threshold;
-    }
-
-    public long lastIncludedIndex() {
-        return log.lastIncludedIndex();
-    }
-
-    /**
-     * Snapshot + compact if the applied, still-physical log prefix has grown past the threshold.
-     * Snapshots through {@code lastApplied} (never an unapplied suffix), persists the snapshot,
-     * then truncates the in-memory log prefix. Idempotent and safe to call after every apply.
-     */
-    public synchronized void maybeCompact() {
-        long base = log.lastIncludedIndex();
-        long appliedPhysical = lastApplied - base;
-        if (appliedPhysical < compactionThreshold || lastApplied <= base) {
-            return;
-        }
-        long term = log.termAt(lastApplied);
-        Snapshot snapshot = Snapshot.of(lastApplied, term, stateMachine.snapshot());
-        if (persistence != null) {
-            try {
-                persistence.recordSnapshot(snapshot);
-            } catch (java.io.IOException e) {
-                throw new RuntimeException("raft persistence failed", e);
-            }
-        }
-        log.compactThrough(lastApplied, term);
     }
 
     /**

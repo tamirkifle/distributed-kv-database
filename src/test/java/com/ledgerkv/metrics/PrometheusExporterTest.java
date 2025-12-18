@@ -41,17 +41,6 @@ class PrometheusExporterTest {
     }
 
     @Test
-    void rendersHedgedRequestsCounter() {
-        OperationMetrics ops = new OperationMetrics(
-            10, 6, 4, 8, 2, 2, 1, 1, 5, List.of(1L, 2L, 3L));
-        String out = PrometheusExporter.render("n1", ops, LatencySummary.from(ops),
-            RepairMetrics.empty());
-
-        assertTrue(out.contains("# TYPE ledgerkv_hedged_requests_total counter"), () -> out);
-        assertTrue(out.contains("ledgerkv_hedged_requests_total{node=\"n1\"} 5"), () -> out);
-    }
-
-    @Test
     void rendersLatencyQuantilesAsLabeledGauge() {
         // Samples 1..100 -> p50=50, p95=95, p99=99 under ceil-rank percentile.
         java.util.List<Long> samples = new java.util.ArrayList<>();

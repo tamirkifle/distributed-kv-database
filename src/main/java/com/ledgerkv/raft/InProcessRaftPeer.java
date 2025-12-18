@@ -40,12 +40,6 @@ public final class InProcessRaftPeer implements RaftPeer {
         return target.handleAppendEntries(request);
     }
 
-    @Override
-    public InstallSnapshotResponse installSnapshot(InstallSnapshotRequest request) {
-        ensureReachable();
-        return target.handleInstallSnapshot(request);
-    }
-
     private void ensureReachable() {
         if (!reachable.getAsBoolean()) {
             throw new RuntimeException("peer " + target.nodeId() + " unreachable (partitioned)");

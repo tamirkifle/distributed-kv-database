@@ -18,7 +18,4 @@ public interface RaftPeer {
 
     /** Invoke AppendEntries on the peer. */
     AppendEntriesResponse appendEntries(AppendEntriesRequest request);
-
-    /** Invoke InstallSnapshot on the peer (Raft §7 catch-up for a far-behind follower). */
-    InstallSnapshotResponse installSnapshot(InstallSnapshotRequest request);
 }
