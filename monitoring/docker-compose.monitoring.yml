@@ -1,0 +1,24 @@
+# Monitoring overlay: Prometheus scrapes the 5 LedgerKV nodes; Grafana auto-provisions a dashboard.
+# Run together with the cluster:
+#   docker compose -f docker-compose.yml -f monitoring/docker-compose.monitoring.yml up -d
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9099:9090"
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana-dashboard.json:/var/lib/grafana/dashboards/ledgerkv.json:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
