@@ -5,9 +5,6 @@ import com.ledgerkv.quorum.ClusterMembership;
 import com.ledgerkv.quorum.GrpcReplicaClient;
 import com.ledgerkv.quorum.LeaderlessKVCluster;
 import com.ledgerkv.quorum.ReplicaClient;
-import com.ledgerkv.metrics.LatencySummary;
-import com.ledgerkv.metrics.PrometheusExporter;
-import com.ledgerkv.metrics.RepairMetrics;
 import com.ledgerkv.transport.NodeClient;
 import com.ledgerkv.transport.NodeServer;
 import java.util.ArrayList;
@@ -32,6 +29,7 @@ public final class NodeMain {
 
         NodeServer server = NodeServer.builder(config.grpcPort()).dataDir(config.dataDir()).build();
         server.start();
+        HealthServer health = HealthServer.start(config.healthPort());
 
         ClusterMembership membership = ClusterMembership.create(
                 config.clusterId(), config.nodeCount(), config.replicationFactor());
@@ -50,18 +48,7 @@ public final class NodeMain {
                 membership,
                 new QuorumConfig(config.replicationFactor(), config.writeQuorum(), config.readQuorum()),
                 replicas);
-        QuorumClientCoordinator coordinator =
-                new QuorumClientCoordinator(cluster, config.nodeIndex());
-        server.useCoordinator(coordinator);
-
-        // RepairMetrics is empty: the leaderless cluster path does not surface a live repair
-        // counter yet (read-repair lives in QuorumKVStoreWithRepair, a separate in-memory demo).
-        HealthServer health = HealthServer.start(config.healthPort(), () ->
-                PrometheusExporter.render(
-                        config.nodeId(),
-                        coordinator.operationMetrics(),
-                        LatencySummary.from(coordinator.operationMetrics()),
-                        RepairMetrics.empty()));
+        server.useCoordinator(new QuorumClientCoordinator(cluster, config.nodeIndex()));
 
         System.out.println("LedgerKV " + config.nodeId() + " up: gRPC=" + config.grpcPort()
                 + " health=" + config.healthPort() + " peers=" + config.peers());

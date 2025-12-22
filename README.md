@@ -63,28 +63,6 @@ A write through any node is replicated across the key's preference list and
 survives the loss of a node. See [`docs/operations.md`](docs/operations.md) for
 configuration, host ports, and the `kill -9` / network-partition demo scripts.
 
-## Observability
-
-Each node exposes a **hand-written Prometheus exporter** at `/metrics` on its
-health port — no Prometheus Java client dependency; the text is rendered straight
-from the node's live quorum-metrics snapshot and served off the same JDK
-`HttpServer` as `/health`. Exported series (labeled by `node`) cover operation
-counts, success/failure and quorum-failure counters, p50/p95/**p99** latency, and
-repair activity.
-
-A `monitoring/` overlay adds Prometheus (scraping all 5 nodes) and an
-auto-provisioned Grafana dashboard (ops rate, **p99 latency**, quorum-failure
-rate, repairs):
-
-```bash
-docker compose -f docker-compose.yml -f monitoring/docker-compose.monitoring.yml up -d
-# Grafana: http://localhost:3000   Prometheus: http://localhost:9099
-```
-
-**p99 under failure:** drive load, run `scripts/demo-kill.sh` to SIGKILL a
-replica, and watch the p99-latency and quorum-failure panels register the blip and
-recover (a screenshot belongs at `docs/images/grafana-p99-under-failure.png`).
-
 ## Benchmarks
 
 All benchmarks run on demand via the `bench` Maven profile and are excluded from `mvn test`

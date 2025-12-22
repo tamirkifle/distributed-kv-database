@@ -35,10 +35,7 @@ public final class WriteAheadLog implements Closeable {
     }
 
     public long append(WalRecord record) throws IOException {
-        return append(record.encode());
-    }
-
-    public long append(byte[] payload) throws IOException {
+        byte[] payload = record.encode();
         ByteBuffer buf = ByteBuffer.allocate(HEADER_BYTES + payload.length);
         buf.putInt(payload.length);
         CRC32 crc = new CRC32();
@@ -101,10 +98,6 @@ public final class WriteAheadLog implements Closeable {
     }
 
     public static void replay(Path path, Consumer<WalRecord> consumer) throws IOException {
-        replayBytes(path, payload -> consumer.accept(WalRecord.decode(payload)));
-    }
-
-    public static void replayBytes(Path path, Consumer<byte[]> consumer) throws IOException {
         if (!Files.exists(path)) {
             return;
         }
@@ -148,7 +141,7 @@ public final class WriteAheadLog implements Closeable {
                     return;
                 }
 
-                consumer.accept(payload);
+                consumer.accept(WalRecord.decode(payload));
                 offset += HEADER_BYTES + len;
             }
         }
