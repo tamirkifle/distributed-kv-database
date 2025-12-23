@@ -3,8 +3,6 @@ package com.ledgerkv.node;
 import com.ledgerkv.QuorumResponse;
 import com.ledgerkv.VersionedValue;
 import com.ledgerkv.quorum.LeaderlessKVCluster;
-import com.ledgerkv.metrics.OperationMetrics;
-import com.ledgerkv.metrics.OperationMetricsCollector;
 import com.ledgerkv.transport.ClientCoordinator;
 import com.ledgerkv.transport.StoredValue;
 import java.nio.charset.StandardCharsets;
@@ -20,22 +18,15 @@ public final class QuorumClientCoordinator implements ClientCoordinator {
 
     private final LeaderlessKVCluster cluster;
     private final int coordinatorIndex;
-    private final OperationMetricsCollector metricsCollector = new OperationMetricsCollector();
 
     public QuorumClientCoordinator(LeaderlessKVCluster cluster, int coordinatorIndex) {
         this.cluster = Objects.requireNonNull(cluster, "cluster must not be null");
         this.coordinatorIndex = coordinatorIndex;
     }
 
-    /** Live snapshot of this coordinator's quorum metrics (drives the Prometheus exporter). */
-    public OperationMetrics operationMetrics() {
-        return metricsCollector.snapshot();
-    }
-
     @Override
     public Optional<StoredValue> get(String key) {
         QuorumResponse response = cluster.read(coordinatorIndex, key);
-        metricsCollector.recordRead(response);
         if (!response.isSuccessful()) {
             throw new IllegalStateException("read quorum not met for key " + key);
         }
@@ -50,7 +41,6 @@ public final class QuorumClientCoordinator implements ClientCoordinator {
     public StoredValue put(String key, byte[] value) {
         String asString = new String(value, StandardCharsets.UTF_8);
         QuorumResponse response = cluster.write(coordinatorIndex, key, asString);
-        metricsCollector.recordWrite(response);
         if (!response.isSuccessful()) {
             throw new IllegalStateException("write quorum not met for key " + key);
         }

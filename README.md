@@ -49,20 +49,6 @@ mvn test -Dtest=ReadRepairTest#testBasicReadRepair
 mvn test -Dtest=AntiEntropyRepairTest
 ```
 
-## Running a cluster (Docker)
-
-LedgerKV runs as a 5-node, quorum-replicated cluster (N=3, W=R=2) via Docker
-Compose:
-
-```bash
-docker compose up -d --build   # 5 nodes, each a quorum coordinator
-curl -fsS http://localhost:8080/health   # -> OK
-```
-
-A write through any node is replicated across the key's preference list and
-survives the loss of a node. See [`docs/operations.md`](docs/operations.md) for
-configuration, host ports, and the `kill -9` / network-partition demo scripts.
-
 ## Benchmarks
 
 All benchmarks run on demand via the `bench` Maven profile and are excluded from `mvn test`
