@@ -161,7 +161,12 @@ class ReadRepairTest {
     @Test
     @DisplayName("Time-based repair avoids repairing fresh writes")
     void testTimeBasedRepair() throws InterruptedException {
-        QuorumConfig config = new QuorumConfig(5, 1, 3);
+        // R=N: read every replica so the read deterministically samples the sole data holder
+        // (node 0). With R<N the quorum read builds its response from whichever R-of-N parallel
+        // reads finish first; when node 0 loses that race the read sees only empty replicas, no
+        // inconsistency is detected, and no repair fires — a thread-scheduling flake. Reading all
+        // replicas removes the race without changing what this test asserts about TIME_BASED repair.
+        QuorumConfig config = new QuorumConfig(5, 1, 5);
         cluster = new QuorumKVStoreWithRepair("test-cluster", config);
         cluster.setNetworkDelayMs(1);
         
