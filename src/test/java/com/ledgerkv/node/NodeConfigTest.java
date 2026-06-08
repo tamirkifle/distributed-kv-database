@@ -69,4 +69,18 @@ class NodeConfigTest {
         env.put("LEDGERKV_NODE_INDEX", "5");
         assertThrows(IllegalArgumentException.class, () -> NodeConfig.fromEnv(env));
     }
+
+    @Test
+    void parsesHedgingDelayFromEnv() {
+        Map<String, String> env = baseEnv();
+        env.put("LEDGERKV_HEDGING_DELAY_MS", "30");
+        NodeConfig config = NodeConfig.fromEnv(env);
+        assertEquals(java.time.Duration.ofMillis(30), config.hedgingDelay());
+    }
+
+    @Test
+    void hedgingDelayDefaultsTo50ms() {
+        NodeConfig config = NodeConfig.fromEnv(baseEnv());
+        assertEquals(java.time.Duration.ofMillis(50), config.hedgingDelay());
+    }
 }

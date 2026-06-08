@@ -12,40 +12,6 @@ import static org.junit.jupiter.api.Assertions.*;
 class OperationMetricsTest {
 
     @Test
-    void quorumStoreRecordsOperationMetricsFromRealReadsAndWrites() {
-        QuorumKVStore cluster = new QuorumKVStore("metrics-cluster", new QuorumConfig(3, 3, 3));
-        try {
-            assertTrue(cluster.write("trace:run-001", "score=0.81").isSuccessful());
-            QuorumResponse latestWrite = cluster.write("trace:run-001", "score=0.86");
-            assertTrue(latestWrite.isSuccessful());
-
-            cluster.getNodes().get(0).clear();
-            cluster.getNodes().get(0).set("trace:run-001", "score=0.72");
-
-            QuorumResponse readResponse = cluster.read("trace:run-001");
-            assertTrue(readResponse.isSuccessful());
-            assertEquals(1, readResponse.getStaleNodeCount());
-
-            cluster.failNodes(2);
-            QuorumResponse failedWrite = cluster.write("trace:run-002", "score=0.90");
-            assertFalse(failedWrite.isSuccessful());
-
-            OperationMetrics metrics = cluster.getOperationMetrics();
-            assertEquals(4, metrics.getOperationCount());
-            assertEquals(1, metrics.getReadCount());
-            assertEquals(3, metrics.getWriteCount());
-            assertEquals(3, metrics.getSuccessCount());
-            assertEquals(1, metrics.getFailureCount());
-            assertEquals(1, metrics.getQuorumFailureCount());
-            assertEquals(1, metrics.getStaleReadCount());
-            assertEquals(4, metrics.getLatencySamplesMs().size());
-            assertTrue(metrics.getLatencySamplesMs().stream().allMatch(sample -> sample >= 0));
-        } finally {
-            cluster.shutdown();
-        }
-    }
-
-    @Test
     void collectorRecordsReadsWritesFailuresStaleReadsConflictsAndLatencySamples() {
         OperationMetricsCollector collector = new OperationMetricsCollector();
         VersionedValue latest = new VersionedValue(

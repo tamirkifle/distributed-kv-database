@@ -16,8 +16,12 @@ public final class OperationMetrics {
     private final long quorumFailureCount;
     private final long staleReadCount;
     private final long conflictCount;
+    private final long hedgedRequestCount;
     private final List<Long> latencySamplesMs;
 
+    /**
+     * Backward-compatible constructor (pre-5b call sites): defaults {@code hedgedRequestCount} to 0.
+     */
     public OperationMetrics(long operationCount,
                             long readCount,
                             long writeCount,
@@ -27,6 +31,20 @@ public final class OperationMetrics {
                             long staleReadCount,
                             long conflictCount,
                             List<Long> latencySamplesMs) {
+        this(operationCount, readCount, writeCount, successCount, failureCount, quorumFailureCount,
+            staleReadCount, conflictCount, 0L, latencySamplesMs);
+    }
+
+    public OperationMetrics(long operationCount,
+                            long readCount,
+                            long writeCount,
+                            long successCount,
+                            long failureCount,
+                            long quorumFailureCount,
+                            long staleReadCount,
+                            long conflictCount,
+                            long hedgedRequestCount,
+                            List<Long> latencySamplesMs) {
         validateNonNegative("operationCount", operationCount);
         validateNonNegative("readCount", readCount);
         validateNonNegative("writeCount", writeCount);
@@ -35,6 +53,7 @@ public final class OperationMetrics {
         validateNonNegative("quorumFailureCount", quorumFailureCount);
         validateNonNegative("staleReadCount", staleReadCount);
         validateNonNegative("conflictCount", conflictCount);
+        validateNonNegative("hedgedRequestCount", hedgedRequestCount);
         Objects.requireNonNull(latencySamplesMs, "latencySamplesMs must not be null");
         for (Long sample : latencySamplesMs) {
             if (sample == null) {
@@ -51,6 +70,7 @@ public final class OperationMetrics {
         this.quorumFailureCount = quorumFailureCount;
         this.staleReadCount = staleReadCount;
         this.conflictCount = conflictCount;
+        this.hedgedRequestCount = hedgedRequestCount;
         this.latencySamplesMs = List.copyOf(latencySamplesMs);
     }
 
@@ -90,6 +110,10 @@ public final class OperationMetrics {
         return conflictCount;
     }
 
+    public long getHedgedRequestCount() {
+        return hedgedRequestCount;
+    }
+
     public List<Long> getLatencySamplesMs() {
         return latencySamplesMs;
     }
@@ -117,13 +141,14 @@ public final class OperationMetrics {
             && quorumFailureCount == that.quorumFailureCount
             && staleReadCount == that.staleReadCount
             && conflictCount == that.conflictCount
+            && hedgedRequestCount == that.hedgedRequestCount
             && latencySamplesMs.equals(that.latencySamplesMs);
     }
 
     @Override
     public int hashCode() {
         return Objects.hash(operationCount, readCount, writeCount, successCount, failureCount,
-            quorumFailureCount, staleReadCount, conflictCount, latencySamplesMs);
+            quorumFailureCount, staleReadCount, conflictCount, hedgedRequestCount, latencySamplesMs);
     }
 
     @Override
@@ -137,6 +162,7 @@ public final class OperationMetrics {
             + ", quorumFailureCount=" + quorumFailureCount
             + ", staleReadCount=" + staleReadCount
             + ", conflictCount=" + conflictCount
+            + ", hedgedRequestCount=" + hedgedRequestCount
             + ", latencySamplesMs=" + latencySamplesMs
             + '}';
     }

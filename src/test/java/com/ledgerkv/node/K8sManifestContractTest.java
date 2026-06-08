@@ -82,4 +82,28 @@ class K8sManifestContractTest {
         assertTrue(ss.contains("path: /health"), "probes hit /health");
         assertTrue(ss.contains("port: 8080"), "probes hit the health port 8080");
     }
+
+    @Test
+    void clientServiceFrontsTheCluster() {
+        String svc = read("k8s/client-service.yaml");
+        assertTrue(svc.contains("kind: Service"), "must be a Service");
+        assertTrue(svc.contains("name: ledgerkv"), "client front-door service named ledgerkv");
+        // ClusterIP (not headless): any node coordinates, so round-robin across pods is correct.
+        assertTrue(!svc.contains("clusterIP: None"), "client service must NOT be headless");
+        assertTrue(svc.contains("app: ledgerkv"), "must select the StatefulSet pods");
+        assertTrue(svc.contains("9090"), "must expose the client gRPC port");
+    }
+
+    @Test
+    void validateScriptIsExecutableAndDryRunsManifests() {
+        String script = read("scripts/k8s-validate.sh");
+        assertTrue(script.startsWith("#!/"), "must have a shebang");
+        assertTrue(script.contains("k8s/"), "must target the k8s manifests dir");
+        assertTrue(script.contains("--dry-run=client") || script.contains("kubeval"),
+                "must validate via kubectl client dry-run or kubeval");
+        assertTrue(script.contains("command -v"),
+                "must degrade gracefully when the tooling is absent (CI may lack a cluster)");
+        assertTrue(java.nio.file.Files.isExecutable(java.nio.file.Paths.get("scripts/k8s-validate.sh")),
+                "script must be chmod +x");
+    }
 }
