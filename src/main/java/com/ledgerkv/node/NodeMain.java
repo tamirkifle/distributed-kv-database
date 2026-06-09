@@ -61,7 +61,7 @@ public final class NodeMain {
         server.useCoordinator(coordinator);
 
         // RepairMetrics is empty: the leaderless cluster path does not surface a live repair
-        // counter yet (read-repair lives in QuorumKVStoreWithRepair, a separate in-memory demo).
+        // counter yet (the leaderless quorum path has no live read-repair counter).
         HealthServer health = HealthServer.start(config.healthPort(), () ->
                 PrometheusExporter.render(
                         config.nodeId(),

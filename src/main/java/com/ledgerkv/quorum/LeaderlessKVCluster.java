@@ -15,6 +15,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.Executors;
@@ -58,8 +60,10 @@ public final class LeaderlessKVCluster implements AutoCloseable {
     private final ClusterMembership membership;
     private final QuorumConfig config;
     private final Map<String, ReplicaClient> clientsByNodeId;
-    private final Map<String, VersionMetadata> versionMetadataByKey;
+    private final ConcurrentMap<String, VersionMetadata> versionMetadataByKey;
     private final List<HintedHandoff> pendingHints;
+    /** Guards the multi-step clear+refill in {@link #replayPendingHints()} against concurrent adds. */
+    private final Object hintsLock = new Object();
     private final ExecutorService executor;
     private final Duration requestDeadline;
     private final Duration hedgingDelay;
@@ -83,7 +87,7 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         }
         this.ownsExecutor = ownsExecutor;
         this.clientsByNodeId = new LinkedHashMap<>();
-        this.versionMetadataByKey = new LinkedHashMap<>();
+        this.versionMetadataByKey = new ConcurrentHashMap<>();
         this.pendingHints = new ArrayList<>();
         for (ClusterNode node : membership.getNodes()) {
             ReplicaClient client = clientsByNodeId.get(node.getId());
@@ -185,7 +189,9 @@ public final class LeaderlessKVCluster implements AutoCloseable {
     }
 
     public List<HintedHandoff> getPendingHints() {
-        return List.copyOf(pendingHints);
+        synchronized (hintsLock) {
+            return List.copyOf(pendingHints);
+        }
     }
 
     public QuorumResponse write(int coordinatorIndex, String key, String value) {
@@ -194,7 +200,16 @@ public final class LeaderlessKVCluster implements AutoCloseable {
 
         long startNanos = System.nanoTime();
         long deadlineNanos = startNanos + requestDeadline.toNanos();
-        VersionMetadata nextMetadata = nextVersionMetadata(key, coordinatorIndex);
+        String coordinatorNodeId = membership.getNodes().get(coordinatorIndex).getId();
+        // Atomically read-modify-write the per-key vector clock so concurrent writers on the same key
+        // cannot lose an increment (the prior get-then-put was a lost-update race). compute() holds the
+        // bucket lock; the lambda is pure (no I/O), so holding it briefly is safe. The clock advances
+        // even when the write later fails to reach W: a failed write may already have landed on some
+        // replicas (which become hinted handoffs carrying this clock), so a later write must not reuse
+        // it — that would let two distinct values share one version.
+        VersionMetadata nextMetadata = versionMetadataByKey.compute(key, (k, current) ->
+            current == null ? VersionMetadata.initial(coordinatorNodeId)
+                            : current.increment(coordinatorNodeId));
         VersionedValue versionedValue = new VersionedValue(value, versionFor(nextMetadata), nextMetadata);
 
         List<ClusterNode> replicas = selectReplicas(key);
@@ -263,7 +278,7 @@ public final class LeaderlessKVCluster implements AutoCloseable {
 
         boolean successful = acknowledgments >= config.getW();
         if (successful) {
-            versionMetadataByKey.put(key, nextMetadata);
+            // The version was already stamped atomically above (compute); only record hints here.
             recordHints(coordinatorIndex, key, value, nextMetadata, failedReplicaIds);
         }
         VersionedValue responseValue = successful ? versionedValue : null;
@@ -272,11 +287,15 @@ public final class LeaderlessKVCluster implements AutoCloseable {
     }
 
     public HintedHandoffReplayResult replayPendingHints() {
-        int attemptedCount = pendingHints.size();
+        List<HintedHandoff> toReplay;
+        synchronized (hintsLock) {
+            toReplay = new ArrayList<>(pendingHints);
+        }
+        int attemptedCount = toReplay.size();
         int appliedCount = 0;
         List<HintedHandoff> remainingHints = new ArrayList<>();
 
-        for (HintedHandoff hint : pendingHints) {
+        for (HintedHandoff hint : toReplay) {
             ReplicaClient client = clientsByNodeId.get(hint.getTargetNodeId());
             if (client == null) {
                 remainingHints.add(hint);
@@ -293,9 +312,16 @@ public final class LeaderlessKVCluster implements AutoCloseable {
             }
         }
 
-        pendingHints.clear();
-        pendingHints.addAll(remainingHints);
-        return new HintedHandoffReplayResult(attemptedCount, appliedCount, pendingHints.size());
+        int outstanding;
+        synchronized (hintsLock) {
+            // Drop exactly the hints we attempted (the delivered ones), preserving any hint added
+            // concurrently during replay; re-queue the ones that still failed. (The prior clear()+
+            // addAll(remaining) would have silently discarded a concurrently-added hint.)
+            pendingHints.removeAll(toReplay);
+            pendingHints.addAll(remainingHints);
+            outstanding = pendingHints.size();
+        }
+        return new HintedHandoffReplayResult(attemptedCount, appliedCount, outstanding);
     }
 
     public QuorumResponse read(int coordinatorIndex, String key) {
@@ -441,6 +467,8 @@ public final class LeaderlessKVCluster implements AutoCloseable {
                 }));
             }
             awaitRepairWrites(repairFutures, repairDeadlineNanos);
+            // Repair adopts the freshest observed clock (it does not mint a new version); a plain
+            // atomic put on the concurrent map is correct here.
             versionMetadataByKey.put(key, latest.getVersionMetadata());
         }
 
@@ -551,15 +579,6 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         }
     }
 
-    private VersionMetadata nextVersionMetadata(String key, int coordinatorIndex) {
-        String coordinatorNodeId = membership.getNodes().get(coordinatorIndex).getId();
-        VersionMetadata current = versionMetadataByKey.get(key);
-        if (current == null) {
-            return VersionMetadata.initial(coordinatorNodeId);
-        }
-        return current.increment(coordinatorNodeId);
-    }
-
     /**
      * Derives the {@code long} version from the vector clock (sum of per-node counters): monotonic
      * along a causal chain, equal for concurrent writes. Reads use it only to pick a proposed latest;
@@ -580,14 +599,16 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         }
 
         String coordinatorNodeId = membership.getNodes().get(coordinatorIndex).getId();
-        for (String failedReplicaId : failedReplicaIds) {
-            pendingHints.add(new HintedHandoff(
-                coordinatorNodeId,
-                failedReplicaId,
-                key,
-                value,
-                versionMetadata
-            ));
+        synchronized (hintsLock) {
+            for (String failedReplicaId : failedReplicaIds) {
+                pendingHints.add(new HintedHandoff(
+                    coordinatorNodeId,
+                    failedReplicaId,
+                    key,
+                    value,
+                    versionMetadata
+                ));
+            }
         }
     }
 

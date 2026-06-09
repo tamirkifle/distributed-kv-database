@@ -3,7 +3,7 @@
 [![CI](https://github.com/tamirkifle/distributed-kv-database/actions/workflows/ci.yml/badge.svg)](https://github.com/tamirkifle/distributed-kv-database/actions/workflows/ci.yml)
 [![Java 11](https://img.shields.io/badge/Java-11-blue.svg)](https://adoptium.net/temurin/releases/?version=11)
 [![Build](https://img.shields.io/badge/build-Maven-C71A36.svg)](https://maven.apache.org/)
-[![Tests](https://img.shields.io/badge/tests-334%20green-success.svg)](#build--test)
+[![Tests](https://img.shields.io/badge/tests-353%20green-success.svg)](#build--test)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 A distributed key-value storage engine built from primitives — a write-ahead log, an
@@ -81,7 +81,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the layered walkthrough a
 
 ```bash
 mvn clean compile     # build
-mvn test              # full test suite (the correctness surface) — 334 tests
+mvn test              # full test suite (the correctness surface) — 353 tests
 mvn clean package     # build a runnable jar (target/ledgerkv.jar)
 ```
 
@@ -164,8 +164,6 @@ Things I'd harden before this were anything other than a portfolio project:
   replica after the hedging delay (`LEDGERKV_HEDGING_DELAY_MS`) — so a dead/slow replica no longer
   head-of-line-blocks its ring neighbors. (Earlier versions fanned out sequentially with no
   timeout.) Further hardening would tune the hedging delay adaptively off the live p95.
-- **No snapshotting on the Raft log.** The Raft WAL grows unbounded (acknowledged in the Phase 3
-  design); log compaction / snapshot install is the natural next step (Phase 5c).
 
 ## Benchmarks
 
@@ -264,12 +262,14 @@ amplification (and the STCS-vs-LCS table in this repo); why `W+R>N` is necessary
 sufficient for linearizability; Raft leader step-down under partition; and what a bounded
 linearizability checker can and cannot prove.
 
-Build + test surface: `mvn test` (334 green), CI runs it on every push (badge at top).
+Build + test surface: `mvn test` (353 green), CI runs it on every push (badge at top).
 
 ## Roadmap
 
-See [docs/roadmap.md](docs/roadmap.md). All five phases are complete: the WAL + LSM storage
-engine with JMH/YCSB benchmarks (Phase 1); a gRPC-networked, containerized, Kubernetes-
-deployed quorum cluster with Prometheus/Grafana (Phase 2); Raft consensus, a Jepsen-style
-linearizability checker, and SSTable range scans (Phase 3); and this presentation layer
-(Phase 4).
+See [docs/roadmap.md](docs/roadmap.md). Phases 0–5 are complete and Phase 6 is in progress:
+the repositioning + CI scaffolding (Phase 0); the WAL + LSM storage engine with JMH/YCSB
+benchmarks (Phase 1); a gRPC-networked, containerized, Kubernetes-deployed quorum cluster with
+Prometheus/Grafana (Phase 2); Raft consensus, a Jepsen-style linearizability checker, and
+SSTable range scans (Phase 3); the presentation layer (Phase 4); tail-latency work —
+deadline-bounded concurrent fan-out, request hedging, and Raft log compaction + snapshotting
+(Phase 5); and adversarial-review remediation and legacy cleanup (Phase 6).
