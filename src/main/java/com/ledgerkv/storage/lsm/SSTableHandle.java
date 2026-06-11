@@ -94,7 +94,8 @@ public final class SSTableHandle implements Closeable {
      * obsoleted). Closes the underlying channel exactly when the last reference is released.
      */
     public void unpin() {
-        if (refCount.decrementAndGet() == 0) {
+        int remaining = refCount.updateAndGet(c -> c > 0 ? c - 1 : 0);
+        if (remaining == 0) {
             try {
                 table.close();
             } catch (IOException ignore) {
@@ -103,8 +104,15 @@ public final class SSTableHandle implements Closeable {
         }
     }
 
+    /**
+     * Closing the handle releases one reference, exactly like {@link #unpin()} — the underlying
+     * channel is closed only when the last reference goes away, so try-with-resources or an explicit
+     * {@code close()} can never rip the channel out from under a concurrently pinned reader. A
+     * redundant {@code close()} after the count already reached zero is a harmless no-op
+     * ({@link java.nio.channels.FileChannel#close()} is itself idempotent).
+     */
     @Override
-    public void close() throws IOException {
-        table.close();
+    public void close() {
+        unpin();
     }
 }

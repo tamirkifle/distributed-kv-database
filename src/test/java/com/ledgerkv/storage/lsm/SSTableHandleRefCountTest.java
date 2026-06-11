@@ -38,6 +38,18 @@ class SSTableHandleRefCountTest {
     }
 
     @Test
+    void closeWhilePinnedDoesNotRipChannelFromReader(@TempDir Path dir) throws Exception {
+        SSTableHandle h = write(dir);          // refCount = 1 (engine ref)
+        h.pin();                                // refCount = 2 (one in-flight reader)
+        h.close();                              // releases the ENGINE ref: refCount = 1, NOT closed
+        assertTrue(h.table().get("a").isPresent(),
+                "close() must not rip the channel out from under a pinned reader");
+        h.unpin();                              // reader done: refCount = 0 -> closed
+        assertThrows(UncheckedIOException.class, () -> h.table().get("a"),
+                "channel closes only when the last reference is released");
+    }
+
+    @Test
     void unpinToZeroClosesExactlyOnce(@TempDir Path dir) throws Exception {
         SSTableHandle h = write(dir);          // refCount = 1
         assertEquals("a", h.firstKey());        // metadata still works
