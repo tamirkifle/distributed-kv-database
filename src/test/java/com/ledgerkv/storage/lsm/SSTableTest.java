@@ -137,4 +137,29 @@ class SSTableTest {
             assertThrows(IllegalArgumentException.class, () -> w.add(Entry.put("a", b("2"), 2)));
         }
     }
+
+    @Test
+    void footerPersistsMaxSequence(@TempDir Path dir) throws IOException {
+        Path path = dir.resolve("sst-maxseq.db");
+        try (SSTableWriter w = new SSTableWriter(path, 3)) {
+            w.add(Entry.put("a", b("1"), 5L));
+            w.add(Entry.put("b", b("2"), 12L));
+            w.add(Entry.put("c", b("3"), 9L)); // out-of-order seq, in-order key
+            w.finish();
+        }
+        try (SSTable t = SSTable.open(path)) {
+            assertEquals(12L, t.maxSequence());
+        }
+    }
+
+    @Test
+    void emptyTableHasZeroMaxSequence(@TempDir Path dir) throws IOException {
+        Path path = dir.resolve("sst-empty.db");
+        try (SSTableWriter w = new SSTableWriter(path, 1)) {
+            w.finish();
+        }
+        try (SSTable t = SSTable.open(path)) {
+            assertEquals(0L, t.maxSequence());
+        }
+    }
 }

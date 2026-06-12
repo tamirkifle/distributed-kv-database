@@ -35,6 +35,7 @@ public final class SSTableWriter implements Closeable {
 
     private long fileOffset;
     private int entryCount;
+    private long maxSequence;
     private String lastKey;
     private boolean finished;
 
@@ -66,6 +67,9 @@ public final class SSTableWriter implements Closeable {
         }
         blockBuf.write(record, 0, record.length);
         entryCount++;
+        if (entry.sequence() > maxSequence) {
+            maxSequence = entry.sequence();
+        }
 
         if (blockBuf.size() >= blockSize) {
             flushBlock();
@@ -101,11 +105,12 @@ public final class SSTableWriter implements Closeable {
         writeFully(ByteBuffer.wrap(indexBytes), indexOffset);
         fileOffset += indexBytes.length;
 
-        // Footer: [bloomOffset:long][indexOffset:long][entryCount:int][magic:int][crc:int].
+        // Footer: [bloomOffset:long][indexOffset:long][entryCount:int][maxSequence:long][magic:int][crc:int].
         ByteBuffer footer = ByteBuffer.allocate(SSTable.FOOTER_BYTES);
         footer.putLong(bloomOffset);
         footer.putLong(indexOffset);
         footer.putInt(entryCount);
+        footer.putLong(maxSequence);
         footer.putInt(SSTable.MAGIC);
         CRC32 fcrc = new CRC32();
         fcrc.update(footer.array(), 0, SSTable.FOOTER_BYTES - 4);

@@ -319,16 +319,14 @@ public final class LsmEngine implements StorageEngine, CompactionContext {
         return maxId;
     }
 
-    /** Highest entry sequence across all loaded SSTables (0 if none). Documented O(entries) scan. */
+    /** Highest entry sequence across all loaded SSTables (0 if none). O(#sstables): reads each
+     *  footer's persisted maxSequence rather than scanning every entry. */
     private long maxSequenceInSstables() {
         long max = 0L;
         for (SSTableHandle h : sstables) {
-            java.util.Iterator<Entry> it = h.table().iterator();
-            while (it.hasNext()) {
-                long s = it.next().sequence();
-                if (s > max) {
-                    max = s;
-                }
+            long s = h.table().maxSequence();
+            if (s > max) {
+                max = s;
             }
         }
         return max;

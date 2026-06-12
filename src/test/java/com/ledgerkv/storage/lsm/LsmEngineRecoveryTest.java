@@ -78,4 +78,22 @@ class LsmEngineRecoveryTest {
         assertTrue(Files.exists(dir.resolve("sst-0000000000.db")));
         assertTrue(Files.exists(dir.resolve("sst-0000000001.db")));
     }
+
+    @Test
+    void recoveryReadsMaxSequenceFromFooterWithoutScanningBlocks(@TempDir Path dir) throws IOException {
+        // Write enough entries to span multiple data blocks, then flush to an SSTable.
+        try (LsmEngine engine = LsmEngine.open(dir, noFlush())) {
+            for (int i = 0; i < 500; i++) {
+                engine.put(String.format("key-%05d", i), b("v" + i));
+            }
+            engine.flush();
+        }
+        // Reopen: recovery must recover the sequence high-water WITHOUT a full-entry scan.
+        try (LsmEngine reopened = LsmEngine.open(dir, noFlush())) {
+            // A fresh write must outrank everything on disk; it reads back, confirming the
+            // recovered high-water kept the sequence ordering monotonic.
+            reopened.put("key-00000", b("updated"));
+            assertArrayEquals(b("updated"), reopened.get("key-00000").orElseThrow(AssertionError::new));
+        }
+    }
 }

@@ -22,24 +22,26 @@ import java.util.zip.CRC32;
 /** An immutable, on-disk sorted run produced by {@link SSTableWriter}. */
 public final class SSTable implements Closeable {
 
-    static final int MAGIC = 0x4C534D31; // "LSM1"
-    static final int FOOTER_BYTES = 28;  // bloomOffset(8) + indexOffset(8) + entryCount(4) + magic(4) + crc(4)
+    static final int MAGIC = 0x4C534D32; // "LSM2" — footer format v2 adds maxSequence
+    static final int FOOTER_BYTES = 36;  // bloomOffset(8) + indexOffset(8) + entryCount(4) + maxSequence(8) + magic(4) + crc(4)
     static final int DEFAULT_BLOCK_SIZE = 4096;
     static final double DEFAULT_FPP = 0.01;
 
     private final FileChannel channel;
     private final BloomFilter bloom;
     private final int entryCount;
+    private final long maxSequence;
     private final String[] firstKeys;
     private final long[] blockOffsets;
     private final int[] blockLengths;
     private int blocksRead;
 
-    private SSTable(FileChannel channel, BloomFilter bloom, int entryCount,
+    private SSTable(FileChannel channel, BloomFilter bloom, int entryCount, long maxSequence,
                     String[] firstKeys, long[] blockOffsets, int[] blockLengths) {
         this.channel = channel;
         this.bloom = bloom;
         this.entryCount = entryCount;
+        this.maxSequence = maxSequence;
         this.firstKeys = firstKeys;
         this.blockOffsets = blockOffsets;
         this.blockLengths = blockLengths;
@@ -59,6 +61,7 @@ public final class SSTable implements Closeable {
             long bloomOffset = footer.getLong();
             long indexOffset = footer.getLong();
             int entryCount = footer.getInt();
+            long maxSequence = footer.getLong();
             int magic = footer.getInt();
             int crc = footer.getInt();
             if (magic != MAGIC) {
@@ -92,7 +95,7 @@ public final class SSTable implements Closeable {
                 blockLengths[i] = indexBuf.getInt();
             }
 
-            SSTable table = new SSTable(channel, bloom, entryCount, firstKeys, blockOffsets, blockLengths);
+            SSTable table = new SSTable(channel, bloom, entryCount, maxSequence, firstKeys, blockOffsets, blockLengths);
             ok = true;
             return table;
         } finally {
@@ -147,6 +150,11 @@ public final class SSTable implements Closeable {
 
     public int entryCount() {
         return entryCount;
+    }
+
+    /** Highest {@link Entry#sequence()} stored in this table (0 if empty). Read from the footer in O(1). */
+    public long maxSequence() {
+        return maxSequence;
     }
 
     /** The smallest key in this table, or {@code null} if the table is empty. */
