@@ -62,4 +62,22 @@ class RaftPersistenceSnapshotTest {
         assertNull(s.snapshot());
         assertEquals(1, s.entries().size());
     }
+
+    @Test
+    void replayDropsSnapshotCoveredPrefixKeepingTail(@TempDir Path dir) throws Exception {
+        try (RaftPersistence p = RaftPersistence.open(dir)) {
+            p.recordTerm(1, null);
+            for (long i = 1; i <= 1000; i++) {
+                p.recordEntry(LogEntry.of(1, i, ("cmd" + i).getBytes(UTF_8)));
+            }
+            // Snapshot through index 990 (term 1). Entries 991..1000 must survive.
+            p.recordSnapshot(Snapshot.of(990, 1, "state".getBytes(UTF_8)));
+        }
+
+        RaftState s = RaftPersistence.replay(dir);
+        assertEquals(990, s.snapshot().lastIncludedIndex());
+        assertEquals(10, s.entries().size());
+        assertEquals(991, s.entries().get(0).index());
+        assertEquals(1000, s.entries().get(s.entries().size() - 1).index());
+    }
 }

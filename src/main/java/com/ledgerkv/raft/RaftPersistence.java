@@ -131,9 +131,16 @@ public final class RaftPersistence implements Closeable {
                     byte[] data = new byte[buf.getInt()];
                     buf.get(data);
                     snapshot[0] = Snapshot.of(lastIncludedIndex, lastIncludedTerm, data);
-                    // Drop any replayed entries the snapshot now covers.
-                    while (!entries.isEmpty() && entries.get(0).index() <= lastIncludedIndex) {
-                        entries.remove(0);
+                    // Drop the contiguous prefix the snapshot now covers. Entries are appended in
+                    // ascending index order, so the covered entries form a prefix; counting then
+                    // clearing it in one subList().clear() is O(N) total (a single arraycopy)
+                    // instead of O(N^2) repeated remove(0).
+                    int drop = 0;
+                    while (drop < entries.size() && entries.get(drop).index() <= lastIncludedIndex) {
+                        drop++;
+                    }
+                    if (drop > 0) {
+                        entries.subList(0, drop).clear();
                     }
                     break;
                 }

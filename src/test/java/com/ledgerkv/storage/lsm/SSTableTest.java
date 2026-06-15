@@ -162,4 +162,47 @@ class SSTableTest {
             assertEquals(0L, t.maxSequence());
         }
     }
+
+    @Test
+    void repeatedBlockReadHitsCacheNotDisk(@TempDir Path dir) throws IOException {
+        Path path = dir.resolve("sst-cache.db");
+        try (SSTableWriter w = new SSTableWriter(path, 10, 64)) { // tiny blocks => many blocks
+            for (int i = 0; i < 10; i++) {
+                w.add(Entry.put(String.format("k%02d", i), b("v" + i), i + 1));
+            }
+            w.finish();
+        }
+        try (SSTable t = SSTable.open(path)) {
+            // First lookup of a key warms its block.
+            assertTrue(t.get("k00").isPresent());
+            int blocksAfterFirst = t.blocksRead();
+            int cacheHitsAfterFirst = t.blockCacheHits();
+            // Second lookup of the SAME key hits the cached block (no extra disk block read).
+            assertTrue(t.get("k00").isPresent());
+            assertEquals(blocksAfterFirst, t.blocksRead(), "repeated read must not re-read the block from disk");
+            assertEquals(cacheHitsAfterFirst + 1, t.blockCacheHits(), "repeated read must register a cache hit");
+            // Correctness: the cached read returns the right value.
+            assertArrayEquals(b("v0"), t.get("k00").orElseThrow(AssertionError::new).value());
+        }
+    }
+
+    @Test
+    void cachedReadsRemainCorrectAcrossManyKeys(@TempDir Path dir) throws IOException {
+        Path path = dir.resolve("sst-cache-correct.db");
+        try (SSTableWriter w = new SSTableWriter(path, 50, 64)) {
+            for (int i = 0; i < 50; i++) {
+                w.add(Entry.put(String.format("k%03d", i), b("val" + i), i + 1));
+            }
+            w.finish();
+        }
+        try (SSTable t = SSTable.open(path)) {
+            for (int round = 0; round < 3; round++) {
+                for (int i = 0; i < 50; i++) {
+                    String k = String.format("k%03d", i);
+                    assertArrayEquals(b("val" + i), t.get(k).orElseThrow(AssertionError::new).value(),
+                            "key " + k + " round " + round);
+                }
+            }
+        }
+    }
 }

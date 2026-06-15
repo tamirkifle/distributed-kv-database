@@ -2,10 +2,9 @@ package com.ledgerkv.storage.lsm;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -16,6 +15,9 @@ class SSTableHandleRefCountTest {
         return s.getBytes(UTF_8);
     }
 
+    // The channel lifecycle (open until refCount hits 0) is SSTableHandle's invariant, asserted
+    // directly via SSTable.isChannelOpen(). A get() is no longer a reliable channel-liveness probe
+    // because the per-table block cache can serve an already-decoded block without touching disk.
     private static SSTableHandle write(Path dir) throws Exception {
         Path path = dir.resolve("t.db");
         try (SSTableWriter w = new SSTableWriter(path, 2)) {
@@ -32,9 +34,9 @@ class SSTableHandleRefCountTest {
         h.pin();                                // refCount = 2 (one reader)
         h.unpin();                              // refCount = 1 -> still open
         assertTrue(h.table().get("a").isPresent(), "channel must still be readable while pinned");
+        assertTrue(h.table().isChannelOpen(), "channel must stay open while a reference remains");
         h.unpin();                              // refCount = 0 -> closed
-        assertThrows(UncheckedIOException.class, () -> h.table().get("a"),
-                "channel must be closed after the last unpin");
+        assertFalse(h.table().isChannelOpen(), "channel must be closed after the last unpin");
     }
 
     @Test
@@ -44,8 +46,9 @@ class SSTableHandleRefCountTest {
         h.close();                              // releases the ENGINE ref: refCount = 1, NOT closed
         assertTrue(h.table().get("a").isPresent(),
                 "close() must not rip the channel out from under a pinned reader");
+        assertTrue(h.table().isChannelOpen(), "channel must stay open for the pinned reader");
         h.unpin();                              // reader done: refCount = 0 -> closed
-        assertThrows(UncheckedIOException.class, () -> h.table().get("a"),
+        assertFalse(h.table().isChannelOpen(),
                 "channel closes only when the last reference is released");
     }
 

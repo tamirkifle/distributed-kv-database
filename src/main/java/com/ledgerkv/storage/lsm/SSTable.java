@@ -15,8 +15,11 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.CRC32;
 
 /** An immutable, on-disk sorted run produced by {@link SSTableWriter}. */
@@ -26,6 +29,8 @@ public final class SSTable implements Closeable {
     static final int FOOTER_BYTES = 36;  // bloomOffset(8) + indexOffset(8) + entryCount(4) + maxSequence(8) + magic(4) + crc(4)
     static final int DEFAULT_BLOCK_SIZE = 4096;
     static final double DEFAULT_FPP = 0.01;
+    /** Max data blocks cached per open SSTable. Small fixed bound: a full scan cannot pin the whole file. */
+    static final int BLOCK_CACHE_CAPACITY = 32;
 
     private final FileChannel channel;
     private final BloomFilter bloom;
@@ -34,7 +39,9 @@ public final class SSTable implements Closeable {
     private final String[] firstKeys;
     private final long[] blockOffsets;
     private final int[] blockLengths;
-    private int blocksRead;
+    private final Map<Integer, List<Entry>> blockCache = new ConcurrentHashMap<>();
+    private final AtomicInteger blocksRead = new AtomicInteger();
+    private final AtomicInteger blockCacheHits = new AtomicInteger();
 
     private SSTable(FileChannel channel, BloomFilter bloom, int entryCount, long maxSequence,
                     String[] firstKeys, long[] blockOffsets, int[] blockLengths) {
@@ -175,9 +182,19 @@ public final class SSTable implements Closeable {
         return firstKeys.length;
     }
 
-    /** Test instrumentation: total data-block reads since open (for block-skipping assertions). */
+    /** Test instrumentation: whether the underlying file channel is still open (ref-count lifecycle). */
+    boolean isChannelOpen() {
+        return channel.isOpen();
+    }
+
+    /** Test instrumentation: total data-block reads from disk since open (for block-skipping assertions). */
     int blocksRead() {
-        return blocksRead;
+        return blocksRead.get();
+    }
+
+    /** Test instrumentation: total block reads served from the in-memory block cache since open. */
+    int blockCacheHits() {
+        return blockCacheHits.get();
     }
 
     /**
@@ -268,7 +285,28 @@ public final class SSTable implements Closeable {
     }
 
     private List<Entry> readBlock(int blockIdx) {
-        blocksRead++;
+        List<Entry> cached = blockCache.get(blockIdx);
+        if (cached != null) {
+            blockCacheHits.incrementAndGet();
+            return cached;
+        }
+        List<Entry> decoded = readBlockFromDisk(blockIdx);
+        // Bounded: evict an arbitrary existing entry before inserting when at capacity, so a full
+        // scan cannot pin every block in memory. Concurrent readers may each decode a missed block
+        // once; only one copy is retained (putIfAbsent) — no corruption, no hot-path lock.
+        if (blockCache.size() >= BLOCK_CACHE_CAPACITY && !blockCache.containsKey(blockIdx)) {
+            Iterator<Integer> it = blockCache.keySet().iterator();
+            if (it.hasNext()) {
+                it.next();
+                it.remove();
+            }
+        }
+        blockCache.putIfAbsent(blockIdx, decoded);
+        return decoded;
+    }
+
+    private List<Entry> readBlockFromDisk(int blockIdx) {
+        blocksRead.incrementAndGet();
         try {
             int length = blockLengths[blockIdx];
             ByteBuffer buf = ByteBuffer.allocate(length);
@@ -283,7 +321,7 @@ public final class SSTable implements Closeable {
                 throw new SSTableCorruptionException(
                         "data block CRC mismatch at offset " + blockOffsets[blockIdx]);
             }
-            return decodeEntries(payload);
+            return Collections.unmodifiableList(decodeEntries(payload));
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
