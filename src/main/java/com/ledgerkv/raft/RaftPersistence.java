@@ -90,6 +90,8 @@ public final class RaftPersistence implements Closeable {
         String[] votedFor = {null};
         List<LogEntry> entries = new ArrayList<>();
         Snapshot[] snapshot = {null};
+        // The snapshot base currently in effect. Invariant: entries.get(i).index() == base + i + 1.
+        long[] base = {0};
         WriteAheadLog.replayBytes(dir.resolve("raft.wal"), payload -> {
             ByteBuffer buf = ByteBuffer.wrap(payload);
             byte kind = buf.get();
@@ -112,15 +114,27 @@ public final class RaftPersistence implements Closeable {
                     long idx = buf.getLong();
                     byte[] cmd = new byte[buf.getInt()];
                     buf.get(cmd);
-                    while (entries.size() >= idx) {
-                        entries.remove(entries.size() - 1); // overwrite at this index
+                    if (idx <= base[0]) {
+                        break; // already covered by a snapshot folded in earlier
+                    }
+                    int slot = (int) (idx - base[0] - 1);
+                    if (slot > entries.size()) {
+                        throw new IllegalStateException("raft WAL gap: entry index " + idx
+                                + " leaves a hole after base " + base[0]
+                                + " with " + entries.size() + " recovered entries");
+                    }
+                    while (entries.size() > slot) {
+                        entries.remove(entries.size() - 1); // overwrite at this absolute index
                     }
                     entries.add(LogEntry.of(t, idx, cmd));
                     break;
                 }
                 case TRUNCATE: {
                     long from = buf.getLong();
-                    while (entries.size() >= from) {
+                    // Absolute index -> physical slot. Anything at or below the base is already
+                    // gone, so a truncation reaching into the base clears the whole tail.
+                    int slot = from <= base[0] + 1 ? 0 : (int) (from - base[0] - 1);
+                    while (entries.size() > slot) {
                         entries.remove(entries.size() - 1);
                     }
                     break;
@@ -142,6 +156,10 @@ public final class RaftPersistence implements Closeable {
                     if (drop > 0) {
                         entries.subList(0, drop).clear();
                     }
+                    // Every later ENTRY/TRUNCATE index is absolute, so replay must keep translating
+                    // through the new base. Comparing them against the shortened list's size
+                    // was the bug.
+                    base[0] = lastIncludedIndex;
                     break;
                 }
                 default:

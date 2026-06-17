@@ -54,6 +54,14 @@ public final class RaftNode {
     // Log-compaction trigger (injectable): compact once this many physical applied entries pile up.
     private int compactionThreshold = Integer.MAX_VALUE; // never auto-compacts by default
 
+    /**
+     * The immutable snapshot covering the current log base, retained so InstallSnapshot ships bytes
+     * that actually match the {@code (lastIncludedIndex, lastIncludedTerm)} they declare. Capturing
+     * {@code stateMachine.snapshot()} at send time instead would describe a later point in history
+     * once further commands were applied. Null iff the base is 0.
+     */
+    private Snapshot lastSnapshot;
+
     public RaftNode(String nodeId, List<String> peerIds, StateMachine stateMachine,
             IntSupplier electionTimeoutSource) {
         this(nodeId, peerIds, stateMachine, electionTimeoutSource, null,
@@ -77,6 +85,7 @@ public final class RaftNode {
             this.log.resetToSnapshot(recoveredSnapshot.lastIncludedIndex(),
                     recoveredSnapshot.lastIncludedTerm());
             this.log.replace(recovered.entries());
+            this.lastSnapshot = recoveredSnapshot;
             this.stateMachine.restore(recoveredSnapshot.data(),
                     recoveredSnapshot.lastIncludedIndex(), recoveredSnapshot.lastIncludedTerm());
             this.commitIndex = recoveredSnapshot.lastIncludedIndex();
@@ -155,14 +164,20 @@ public final class RaftNode {
             commitIndex = Math.min(req.leaderCommit(), log.lastIndex());
             applyCommitted();
         }
-        return AppendEntriesResponse.success(currentTerm, log.lastIndex());
+        // Acknowledge the last index THIS request established, not the local tail. A follower may
+        // hold a longer uncommitted suffix that the leader never verified; reporting it would let
+        // the leader advance nextIndex past the end of its own log.
+        return AppendEntriesResponse.success(currentTerm, req.prevLogIndex() + req.entries().size());
     }
 
     /**
      * Follower side of InstallSnapshot (Raft §7): a leader ships a snapshot when the entries this
-     * follower needs have been compacted away. Reject a stale term; otherwise discard the local log
-     * (replaced by the snapshot), restore the state machine, advance commit/applied to the base, and
-     * persist the snapshot. Idempotent: a snapshot we already cover is ignored.
+     * follower needs have been compacted away. Reject a stale term, then ignore any snapshot that
+     * does not advance past what is already committed here — a delayed snapshot must never roll
+     * committed/applied state backward. For a snapshot that does advance:
+     * if the local log already contains a matching entry at {@code lastIncludedIndex}, retain the
+     * suffix above it (§7's "retain log entries following it"); otherwise discard the log entirely.
+     * Either way restore the state machine, advance commit/applied to the base, and persist.
      */
     public synchronized InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest req) {
         if (req.term() < currentTerm) {
@@ -174,18 +189,27 @@ public final class RaftNode {
         role = RaftRole.FOLLOWER;
         resetElectionTimer();
 
-        if (req.lastIncludedIndex() <= log.lastIncludedIndex()) {
+        // commitIndex >= lastApplied always, so this one guard prevents both regressions. It also
+        // subsumes the old "already compacted" check, since commitIndex >= lastIncludedIndex.
+        if (req.lastIncludedIndex() <= log.lastIncludedIndex()
+                || req.lastIncludedIndex() <= commitIndex) {
             return InstallSnapshotResponse.of(currentTerm); // already covered
         }
 
-        log.resetToSnapshot(req.lastIncludedIndex(), req.lastIncludedTerm());
+        if (log.matches(req.lastIncludedIndex(), req.lastIncludedTerm())) {
+            log.compactThrough(req.lastIncludedIndex(), req.lastIncludedTerm());
+        } else {
+            log.resetToSnapshot(req.lastIncludedIndex(), req.lastIncludedTerm());
+        }
         stateMachine.restore(req.data(), req.lastIncludedIndex(), req.lastIncludedTerm());
         commitIndex = req.lastIncludedIndex();
         lastApplied = req.lastIncludedIndex();
+        // Retain the exact bytes for this base so a later relay of this snapshot still matches its
+        // declared metadata.
+        lastSnapshot = Snapshot.of(req.lastIncludedIndex(), req.lastIncludedTerm(), req.data());
         if (persistence != null) {
             try {
-                persistence.recordSnapshot(
-                        Snapshot.of(req.lastIncludedIndex(), req.lastIncludedTerm(), req.data()));
+                persistence.recordSnapshot(lastSnapshot);
             } catch (java.io.IOException e) {
                 throw new RuntimeException("raft persistence failed", e);
             }
@@ -333,8 +357,14 @@ public final class RaftNode {
 
     private void sendSnapshot(RaftPeer peer) {
         long base = log.lastIncludedIndex();
+        if (lastSnapshot == null || lastSnapshot.lastIncludedIndex() != base) {
+            // The log base and the retained snapshot are set together; a mismatch means a caller
+            // moved the base without capturing its bytes. Fail loudly rather than ship a snapshot
+            // whose contents disagree with its metadata.
+            throw new IllegalStateException("no retained snapshot for log base " + base);
+        }
         InstallSnapshotRequest req = InstallSnapshotRequest.of(
-                currentTerm, nodeId, base, log.lastIncludedTerm(), stateMachine.snapshot());
+                currentTerm, nodeId, base, lastSnapshot.lastIncludedTerm(), lastSnapshot.data());
         try {
             InstallSnapshotResponse resp = peer.installSnapshot(req);
             if (resp.term() > currentTerm) {
@@ -374,6 +404,8 @@ public final class RaftNode {
             return;
         }
         long term = log.termAt(lastApplied);
+        // Capture the bytes and the position they cover in one step, then keep them: this exact
+        // pair is what InstallSnapshot later ships.
         Snapshot snapshot = Snapshot.of(lastApplied, term, stateMachine.snapshot());
         if (persistence != null) {
             try {
@@ -383,6 +415,7 @@ public final class RaftNode {
             }
         }
         log.compactThrough(lastApplied, term);
+        lastSnapshot = snapshot;
     }
 
     /**
