@@ -52,6 +52,12 @@ class RaftReviewRegressionTest {
      * the request only verified an earlier prefix, so the leader advanced {@code nextIndex} past the
      * end of its own log and the next tick threw
      * {@code IndexOutOfBoundsException: no entry at index 3 (base=0, last=1)}.
+     *
+     * <p>Since 7b, a new leader appends a §8 no-op barrier, and replicating it repairs {@code b}'s
+     * divergent suffix in this same round — so this scenario no longer reaches the over-reporting
+     * follower state. It is kept as the end-to-end crash guard; the precise regression guard for
+     * this finding is {@link #acknowledgedMatchIndexIsTheIndexTheRequestEstablished()}, which drives
+     * an empty heartbeat against a longer local log directly.
      */
     @Test
     void longerUncommittedFollowerSuffixMustNotCrashTheLeader() {
@@ -69,8 +75,9 @@ class RaftReviewRegressionTest {
         // a wins with c; b holds a longer uncommitted suffix and legitimately refuses its vote.
         a.tick();
         assertTrue(a.isLeader());
-        assertEquals(1, a.log().lastIndex());
-        assertEquals(3, b.log().lastIndex());
+        assertEquals(2, a.log().lastIndex(), "a's own entry plus its no-op barrier");
+        assertEquals(2, b.log().lastIndex(),
+            "replicating the barrier truncated b's divergent term-1 suffix");
 
         assertDoesNotThrow(a::tick,
             "a follower acknowledgement must not advance nextIndex beyond the leader's own log");
@@ -161,17 +168,18 @@ class RaftReviewRegressionTest {
 
         leader.tick();
         assertTrue(leader.isLeader());
+        // Index 1 is the no-op barrier (Raft §8), so c1 and c2 occupy 2 and 3.
         leader.propose("c1".getBytes(UTF_8));
         leader.propose("c2".getBytes(UTF_8));
         leader.setCompactionThreshold(2);
         leader.maybeCompact();
-        assertEquals(2, leader.lastIncludedIndex());
+        assertEquals(3, leader.lastIncludedIndex());
         leader.propose("c3".getBytes(UTF_8));
-        assertEquals(3, leader.lastApplied());
+        assertEquals(4, leader.lastApplied());
 
         reachable.set(true);
-        leader.tick(); // ships the snapshot: base 2 must contain only c1 and c2
-        assertEquals(2, lagging.lastApplied());
+        leader.tick(); // ships the snapshot: base 3 must contain only c1 and c2
+        assertEquals(3, lagging.lastApplied());
         leader.tick(); // replicates and applies c3 exactly once
 
         assertEquals(List.of("c1", "c2", "c3"), laggingSm.applied,
@@ -237,8 +245,8 @@ class RaftReviewRegressionTest {
         leader.tick();
         assertTrue(leader.isLeader());
 
-        assertEquals(1, leader.propose("c1".getBytes(UTF_8)));
-        assertEquals(1, leader.commitIndex());
-        assertEquals(1, leader.lastApplied());
+        assertEquals(2, leader.propose("c1".getBytes(UTF_8)));
+        assertEquals(2, leader.commitIndex());
+        assertEquals(2, leader.lastApplied());
     }
 }

@@ -44,16 +44,17 @@ class RaftNodeCompactionTest {
         for (int i = 1; i <= 5; i++) {
             node.propose(("c" + i).getBytes(UTF_8)); // single-node: each commits+applies immediately
         }
-        assertEquals(5, node.log().lastIndex());
-        assertEquals(5, node.lastApplied());
+        // Index 1 is the leader's no-op barrier (Raft §8), so c1..c5 occupy 2..6.
+        assertEquals(6, node.log().lastIndex());
+        assertEquals(6, node.lastApplied());
 
         node.maybeCompact();
 
-        assertEquals(5, node.lastIncludedIndex(), "compacted through lastApplied");
+        assertEquals(6, node.lastIncludedIndex(), "compacted through lastApplied");
         assertEquals(0, node.log().size(), "physical entries dropped");
-        assertEquals(5, node.log().lastIndex(), "absolute last index preserved");
+        assertEquals(6, node.log().lastIndex(), "absolute last index preserved");
         // a new proposal still appends at the next dense absolute index
-        assertEquals(6, node.propose("c6".getBytes(UTF_8)));
+        assertEquals(7, node.propose("c6".getBytes(UTF_8)));
     }
 
     @Test
@@ -65,7 +66,7 @@ class RaftNodeCompactionTest {
         }
         node.maybeCompact();
         assertEquals(0, node.lastIncludedIndex(), "below threshold: no compaction");
-        assertEquals(5, node.log().size());
+        assertEquals(6, node.log().size(), "5 commands plus the no-op barrier");
     }
 
     @Test

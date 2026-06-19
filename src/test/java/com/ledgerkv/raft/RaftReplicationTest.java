@@ -64,9 +64,10 @@ class RaftReplicationTest {
         List<String> ids = Arrays.asList("n0", "n1", "n2");
         RaftNode leader = electLeader("n0", ids);
 
+        // Index 1 is the leader's no-op barrier (Raft §8), so the first command lands at 2.
         long index = leader.propose("set x=1".getBytes());
-        assertEquals(1, index);
-        assertEquals(1, leader.commitIndex());
+        assertEquals(2, index);
+        assertEquals(2, leader.commitIndex());
         assertEquals(Arrays.asList("set x=1"), recorders.get("n0").applied);
 
         // a heartbeat propagates the commit index to followers, who then apply
@@ -81,7 +82,8 @@ class RaftReplicationTest {
         electLeader("n0", ids);
         RaftNode follower = nodes.get("n1");
         assertEquals(0, follower.propose("nope".getBytes()));
-        assertEquals(0, follower.log().lastIndex());
+        // The follower holds only the leader's replicated no-op barrier; propose added nothing.
+        assertEquals(1, follower.log().lastIndex());
     }
 
     @Test
@@ -93,6 +95,7 @@ class RaftReplicationTest {
         follower.handleAppendEntries(AppendEntriesRequest.of(leader.currentTerm(), "n0", 0, 0,
                 Collections.singletonList(LogEntry.of(99, 1, "garbage".getBytes())), 0));
         assertEquals(99, follower.log().termAt(1));
+        // The divergent entry overwrote the replicated barrier, so repair must rebuild from index 1.
 
         // leader proposes real entries and drives heartbeats until convergence
         leader.propose("real1".getBytes());
@@ -101,7 +104,7 @@ class RaftReplicationTest {
             leader.tick();
         }
         assertEquals(leader.log().lastIndex(), follower.log().lastIndex());
-        assertEquals("real1", new String(follower.log().entryAt(1).command()));
-        assertEquals("real2", new String(follower.log().entryAt(2).command()));
+        assertEquals("real1", new String(follower.log().entryAt(2).command()));
+        assertEquals("real2", new String(follower.log().entryAt(3).command()));
     }
 }

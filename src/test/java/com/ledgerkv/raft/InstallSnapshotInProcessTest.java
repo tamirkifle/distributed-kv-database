@@ -70,7 +70,8 @@ class InstallSnapshotInProcessTest {
         for (int i = 0; i < 4; i++) {
             leader.tick(); // replicate+commit to n1
         }
-        assertEquals(5, leader.lastApplied());
+        // Index 1 is the leader's no-op barrier (Raft §8), so c1..c5 occupy 2..6.
+        assertEquals(6, leader.lastApplied());
 
         // Leader compacts past index 2 -> n2's nextIndex (1) now precedes the base.
         leader.maybeCompact();

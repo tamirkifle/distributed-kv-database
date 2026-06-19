@@ -237,7 +237,11 @@ public final class RaftNode {
     private void applyCommitted() {
         while (lastApplied < commitIndex) {
             lastApplied++;
-            stateMachine.apply(log.entryAt(lastApplied).command());
+            byte[] command = log.entryAt(lastApplied).command();
+            if (command.length == 0) {
+                continue; // §8 no-op barrier: a log record only, never a state-machine command
+            }
+            stateMachine.apply(command);
         }
     }
 
@@ -316,7 +320,16 @@ public final class RaftNode {
             nextIndex.put(peerId, log.lastIndex() + 1);
             matchIndex.put(peerId, 0L);
         }
+        // Raft §8: a new leader cannot trust its commit index until it has committed an entry from
+        // its own term, because §5.4.2 forbids committing a prior-term entry by match count alone.
+        // Appending an empty barrier entry makes that true immediately, which is what lets
+        // readIndex() serve a linearizable read without waiting for the term's first write.
+        long barrier = log.lastIndex() + 1;
+        log.append(LogEntry.of(currentTerm, barrier, new byte[0]));
+        persistEntry(log.entryAt(barrier));
+        matchIndex.put(nodeId, barrier);
         sendHeartbeats();
+        advanceCommitIndex();
     }
 
     private void sendHeartbeats() {
@@ -325,12 +338,47 @@ public final class RaftNode {
         }
     }
 
-    private void replicateTo(RaftPeer peer) {
+    /**
+     * Establishes that this node is still the leader by exchanging one replication round with the
+     * cluster and requiring a majority of positive acknowledgements (Raft §8 / the ReadIndex
+     * protocol). An isolated former leader reaches nobody, counts only itself, and fails here.
+     */
+    private boolean confirmLeadership() {
+        int acknowledgements = 1; // the leader counts itself
+        for (RaftPeer peer : peers.values()) {
+            if (replicateTo(peer)) {
+                acknowledgements++;
+            }
+        }
+        return role == RaftRole.LEADER && hasMajority(acknowledgements);
+    }
+
+    /**
+     * The commit index a linearizable read may be served at, or {@code -1} when this node cannot
+     * safely answer — it is not the leader, it has not yet committed an entry from its own term, or
+     * it could not confirm leadership against a majority. Callers must wait for
+     * {@link #lastApplied()} to reach the returned index before reading the state machine.
+     */
+    public synchronized long readIndex() {
+        if (role != RaftRole.LEADER) {
+            return -1;
+        }
+        if (log.termAt(commitIndex) != currentTerm) {
+            return -1; // no current-term commit yet: the commit index is not yet trustworthy
+        }
+        long index = commitIndex;
+        if (!confirmLeadership()) {
+            return -1;
+        }
+        return index;
+    }
+
+    /** Replicates to one peer; returns true iff the peer positively acknowledged this round. */
+    private boolean replicateTo(RaftPeer peer) {
         long ni = nextIndex.getOrDefault(peer.nodeId(), log.lastIndex() + 1);
         if (ni <= log.lastIncludedIndex()) {
             // The entries this follower needs are compacted away — ship the snapshot instead.
-            sendSnapshot(peer);
-            return;
+            return sendSnapshot(peer);
         }
         long prevLogIndex = ni - 1;
         long prevLogTerm = log.termAt(prevLogIndex);
@@ -341,21 +389,23 @@ public final class RaftNode {
             AppendEntriesResponse resp = peer.appendEntries(req);
             if (resp.term() > currentTerm) {
                 stepDown(resp.term());
-                return;
+                return false;
             }
             if (resp.success()) {
                 matchIndex.put(peer.nodeId(), resp.matchIndex());
                 nextIndex.put(peer.nodeId(), resp.matchIndex() + 1);
                 advanceCommitIndex();
-            } else {
-                nextIndex.put(peer.nodeId(), Math.max(1, resp.conflictIndex()));
+                return true;
             }
+            nextIndex.put(peer.nodeId(), Math.max(1, resp.conflictIndex()));
+            return false;
         } catch (RuntimeException unreachable) {
             // dropped AppendEntries: retry on the next heartbeat.
+            return false;
         }
     }
 
-    private void sendSnapshot(RaftPeer peer) {
+    private boolean sendSnapshot(RaftPeer peer) {
         long base = log.lastIncludedIndex();
         if (lastSnapshot == null || lastSnapshot.lastIncludedIndex() != base) {
             // The log base and the retained snapshot are set together; a mismatch means a caller
@@ -369,13 +419,15 @@ public final class RaftNode {
             InstallSnapshotResponse resp = peer.installSnapshot(req);
             if (resp.term() > currentTerm) {
                 stepDown(resp.term());
-                return;
+                return false;
             }
             matchIndex.put(peer.nodeId(), base);
             nextIndex.put(peer.nodeId(), base + 1);
             advanceCommitIndex();
+            return true;
         } catch (RuntimeException unreachable) {
             // dropped InstallSnapshot: retry on the next heartbeat.
+            return false;
         }
     }
 

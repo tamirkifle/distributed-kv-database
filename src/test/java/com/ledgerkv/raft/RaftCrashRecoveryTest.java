@@ -33,12 +33,14 @@ class RaftCrashRecoveryTest {
         assertTrue(recovered.currentTerm() >= 1, "term must survive the crash");
         assertEquals("n0", recovered.votedFor(), "self-vote must survive the crash");
 
+        // Index 1 is the leader's no-op barrier (Raft §8); the proposed commands follow it.
         List<LogEntry> entries = recovered.entries();
-        assertEquals(count, entries.size(), "every fsync'd entry must survive");
+        assertEquals(count + 1, entries.size(), "every fsync'd entry must survive");
+        assertEquals(0, entries.get(0).command().length, "index 1 is the no-op barrier");
         for (int i = 0; i < count; i++) {
-            assertEquals(i + 1, entries.get(i).index(), "entries must be in dense index order");
-            assertArrayEquals(RaftCrashHarness.cmd(i).getBytes(UTF_8), entries.get(i).command(),
-                    "wrong command at index " + (i + 1));
+            assertEquals(i + 2, entries.get(i + 1).index(), "entries must be in dense index order");
+            assertArrayEquals(RaftCrashHarness.cmd(i).getBytes(UTF_8), entries.get(i + 1).command(),
+                    "wrong command at index " + (i + 2));
         }
     }
 }

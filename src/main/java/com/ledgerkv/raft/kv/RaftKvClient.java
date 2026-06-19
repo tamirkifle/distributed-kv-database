@@ -62,9 +62,23 @@ public final class RaftKvClient {
         return leaderStateMachine.resultFor(clientId, cmd.sequenceNumber());
     }
 
-    /** Linearizable leader read: drain committed entries to the apply pipeline, then read. */
+    /**
+     * Linearizable leader read via the ReadIndex barrier (Raft §8): establish a read index — which
+     * requires this node to be the leader, to have committed an entry from its current term, and to
+     * confirm leadership against a majority — then wait for the apply pipeline to reach it before
+     * serving off applied state.
+     *
+     * <p>Refuses rather than answering from stale local state when leadership cannot be
+     * established: an isolated former leader has no way to learn that a newer leader has already
+     * superseded the value it holds.
+     */
     public byte[] get(String key) {
-        driveUntilApplied(leader.commitIndex());
+        long readIndex = leader.readIndex();
+        if (readIndex < 0) {
+            throw new IllegalStateException(
+                    "leadership could not be confirmed for a linearizable read");
+        }
+        driveUntilApplied(readIndex);
         return leaderStateMachine.get(key);
     }
 
