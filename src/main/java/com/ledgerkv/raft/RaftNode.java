@@ -55,6 +55,23 @@ public final class RaftNode {
     private int compactionThreshold = Integer.MAX_VALUE; // never auto-compacts by default
 
     /**
+     * Mirrors {@code lastApplied} for readers that must not acquire this node's monitor. A client
+     * waiting for its proposal to be applied blocks on {@code appliedMonitor}; {@code applyCommitted}
+     * holds the node monitor and then briefly takes {@code appliedMonitor} to publish. The waiter
+     * never takes the node monitor, so the two can never deadlock against each other.
+     */
+    private final java.util.concurrent.atomic.AtomicLong appliedWatermark =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final Object appliedMonitor = new Object();
+
+    /**
+     * When true, {@link #tick()} no longer performs replication itself — a {@link
+     * RaftReplicationDriver} owns per-peer replication on its own threads. Election timeouts still
+     * run on the tick.
+     */
+    private volatile boolean replicationDelegated = false;
+
+    /**
      * The immutable snapshot covering the current log base, retained so InstallSnapshot ships bytes
      * that actually match the {@code (lastIncludedIndex, lastIncludedTerm)} they declare. Capturing
      * {@code stateMachine.snapshot()} at send time instead would describe a later point in history
@@ -93,6 +110,7 @@ public final class RaftNode {
         } else {
             this.log.replace(recovered.entries());
         }
+        this.appliedWatermark.set(this.lastApplied);
     }
 
     /** Closes the durable persistence handle if any (no-op in in-memory mode). */
@@ -204,6 +222,7 @@ public final class RaftNode {
         stateMachine.restore(req.data(), req.lastIncludedIndex(), req.lastIncludedTerm());
         commitIndex = req.lastIncludedIndex();
         lastApplied = req.lastIncludedIndex();
+        publishApplied();
         // Retain the exact bytes for this base so a later relay of this snapshot still matches its
         // declared metadata.
         lastSnapshot = Snapshot.of(req.lastIncludedIndex(), req.lastIncludedTerm(), req.data());
@@ -243,6 +262,34 @@ public final class RaftNode {
             }
             stateMachine.apply(command);
         }
+        publishApplied();
+    }
+
+    /** Publishes {@code lastApplied} to waiters that are not holding this node's monitor. */
+    private void publishApplied() {
+        if (appliedWatermark.getAndSet(lastApplied) != lastApplied) {
+            synchronized (appliedMonitor) {
+                appliedMonitor.notifyAll();
+            }
+        }
+    }
+
+    /**
+     * Blocks until this node has applied {@code index}, or the timeout elapses. Does not hold the
+     * node monitor, so replication and inbound RPCs continue while a client waits here.
+     */
+    public boolean awaitApplied(long index, java.time.Duration timeout) throws InterruptedException {
+        long deadlineNanos = System.nanoTime() + timeout.toNanos();
+        synchronized (appliedMonitor) {
+            while (appliedWatermark.get() < index) {
+                long remaining = deadlineNanos - System.nanoTime();
+                if (remaining <= 0) {
+                    return false;
+                }
+                appliedMonitor.wait(Math.max(1L, remaining / 1_000_000L));
+            }
+        }
+        return true;
     }
 
     private void resetElectionTimer() {
@@ -263,6 +310,9 @@ public final class RaftNode {
 
     public synchronized void tick() {
         if (role == RaftRole.LEADER) {
+            if (replicationDelegated) {
+                return; // the driver's per-peer threads own replication
+            }
             heartbeatElapsed++;
             if (heartbeatElapsed >= HEARTBEAT_INTERVAL) {
                 heartbeatElapsed = 0;
@@ -328,7 +378,9 @@ public final class RaftNode {
         log.append(LogEntry.of(currentTerm, barrier, new byte[0]));
         persistEntry(log.entryAt(barrier));
         matchIndex.put(nodeId, barrier);
-        sendHeartbeats();
+        if (!replicationDelegated) {
+            sendHeartbeats();
+        }
         advanceCommitIndex();
     }
 
@@ -373,62 +425,95 @@ public final class RaftNode {
         return index;
     }
 
-    /** Replicates to one peer; returns true iff the peer positively acknowledged this round. */
+    /**
+     * Replicates to one peer inline; returns true iff the peer positively acknowledged this round.
+     * This is the synchronous, tick-driven path used by the deterministic harnesses. A
+     * {@link RaftReplicationDriver} performs the same exchange with the monitor released, using
+     * {@link #nextReplicationRequest(String)} and the {@code apply*Response} handlers below.
+     */
     private boolean replicateTo(RaftPeer peer) {
-        long ni = nextIndex.getOrDefault(peer.nodeId(), log.lastIndex() + 1);
-        if (ni <= log.lastIncludedIndex()) {
-            // The entries this follower needs are compacted away — ship the snapshot instead.
-            return sendSnapshot(peer);
-        }
-        long prevLogIndex = ni - 1;
-        long prevLogTerm = log.termAt(prevLogIndex);
-        List<LogEntry> entries = log.from(ni);
-        AppendEntriesRequest req = AppendEntriesRequest.of(
-                currentTerm, nodeId, prevLogIndex, prevLogTerm, entries, commitIndex);
-        try {
-            AppendEntriesResponse resp = peer.appendEntries(req);
-            if (resp.term() > currentTerm) {
-                stepDown(resp.term());
-                return false;
-            }
-            if (resp.success()) {
-                matchIndex.put(peer.nodeId(), resp.matchIndex());
-                nextIndex.put(peer.nodeId(), resp.matchIndex() + 1);
-                advanceCommitIndex();
-                return true;
-            }
-            nextIndex.put(peer.nodeId(), Math.max(1, resp.conflictIndex()));
+        ReplicationRequest request = nextReplicationRequest(peer.nodeId());
+        if (request == null) {
             return false;
+        }
+        try {
+            if (request.isSnapshot()) {
+                InstallSnapshotResponse resp = peer.installSnapshot(request.snapshot());
+                applyInstallSnapshotResponse(
+                        peer.nodeId(), resp, request.snapshot().lastIncludedIndex());
+                return role == RaftRole.LEADER;
+            }
+            AppendEntriesResponse resp = peer.appendEntries(request.entries());
+            applyAppendEntriesResponse(peer.nodeId(), resp);
+            return resp.success() && role == RaftRole.LEADER;
         } catch (RuntimeException unreachable) {
-            // dropped AppendEntries: retry on the next heartbeat.
+            // dropped RPC: retry on the next heartbeat.
             return false;
         }
     }
 
-    private boolean sendSnapshot(RaftPeer peer) {
-        long base = log.lastIncludedIndex();
-        if (lastSnapshot == null || lastSnapshot.lastIncludedIndex() != base) {
-            // The log base and the retained snapshot are set together; a mismatch means a caller
-            // moved the base without capturing its bytes. Fail loudly rather than ship a snapshot
-            // whose contents disagree with its metadata.
-            throw new IllegalStateException("no retained snapshot for log base " + base);
+    /**
+     * The next replication message owed to {@code peerId}, or null if this node is not the leader.
+     * Built under the node monitor so the caller can perform the RPC without holding it.
+     */
+    public synchronized ReplicationRequest nextReplicationRequest(String peerId) {
+        if (role != RaftRole.LEADER) {
+            return null;
         }
-        InstallSnapshotRequest req = InstallSnapshotRequest.of(
-                currentTerm, nodeId, base, lastSnapshot.lastIncludedTerm(), lastSnapshot.data());
-        try {
-            InstallSnapshotResponse resp = peer.installSnapshot(req);
-            if (resp.term() > currentTerm) {
-                stepDown(resp.term());
-                return false;
+        long ni = nextIndex.getOrDefault(peerId, log.lastIndex() + 1);
+        if (ni <= log.lastIncludedIndex()) {
+            // The entries this follower needs are compacted away — ship the snapshot instead.
+            long base = log.lastIncludedIndex();
+            if (lastSnapshot == null || lastSnapshot.lastIncludedIndex() != base) {
+                // The log base and the retained snapshot are set together; a mismatch means a
+                // caller moved the base without capturing its bytes. Fail loudly rather than ship
+                // a snapshot whose contents disagree with its metadata.
+                throw new IllegalStateException("no retained snapshot for log base " + base);
             }
-            matchIndex.put(peer.nodeId(), base);
-            nextIndex.put(peer.nodeId(), base + 1);
-            advanceCommitIndex();
-            return true;
-        } catch (RuntimeException unreachable) {
-            // dropped InstallSnapshot: retry on the next heartbeat.
-            return false;
+            return ReplicationRequest.snapshot(InstallSnapshotRequest.of(
+                    currentTerm, nodeId, base, lastSnapshot.lastIncludedTerm(),
+                    lastSnapshot.data()));
         }
+        long prevLogIndex = ni - 1;
+        return ReplicationRequest.entries(AppendEntriesRequest.of(currentTerm, nodeId, prevLogIndex,
+                log.termAt(prevLogIndex), log.from(ni), commitIndex));
+    }
+
+    /** Folds a peer's AppendEntries reply into leader progress. Safe to call from any thread. */
+    public synchronized void applyAppendEntriesResponse(String peerId, AppendEntriesResponse resp) {
+        if (resp.term() > currentTerm) {
+            stepDown(resp.term());
+            return;
+        }
+        if (role != RaftRole.LEADER || resp.term() < currentTerm) {
+            return; // stale reply from an earlier term or role
+        }
+        if (resp.success()) {
+            // Replies can arrive out of order once peers run on their own threads, so match
+            // progress only ever moves forward within a term.
+            long matched = Math.max(matchIndex.getOrDefault(peerId, 0L), resp.matchIndex());
+            matchIndex.put(peerId, matched);
+            nextIndex.put(peerId, matched + 1);
+            advanceCommitIndex();
+        } else {
+            nextIndex.put(peerId, Math.max(1, resp.conflictIndex()));
+        }
+    }
+
+    /** Folds a peer's InstallSnapshot reply into leader progress. Safe to call from any thread. */
+    public synchronized void applyInstallSnapshotResponse(
+            String peerId, InstallSnapshotResponse resp, long lastIncludedIndex) {
+        if (resp.term() > currentTerm) {
+            stepDown(resp.term());
+            return;
+        }
+        if (role != RaftRole.LEADER) {
+            return;
+        }
+        long matched = Math.max(matchIndex.getOrDefault(peerId, 0L), lastIncludedIndex);
+        matchIndex.put(peerId, matched);
+        nextIndex.put(peerId, matched + 1);
+        advanceCommitIndex();
     }
 
     public long lastApplied() {
@@ -476,6 +561,22 @@ public final class RaftNode {
      * this node is not the leader.
      */
     public synchronized long propose(byte[] command) {
+        long index = proposeLocal(command);
+        if (index == 0) {
+            return 0;
+        }
+        sendHeartbeats();
+        advanceCommitIndex();
+        return index;
+    }
+
+    /**
+     * Appends and durably records a command on the leader <em>without</em> contacting any peer, and
+     * returns its assigned index (0 if not leader). This is the half of {@link #propose(byte[])} a
+     * {@link RaftReplicationDriver} uses: the caller then wakes the peer threads and waits on
+     * {@link #awaitApplied(long, java.time.Duration)}, so no peer I/O happens on its thread.
+     */
+    public synchronized long proposeLocal(byte[] command) {
         if (role != RaftRole.LEADER) {
             return 0;
         }
@@ -483,9 +584,13 @@ public final class RaftNode {
         log.append(LogEntry.of(currentTerm, index, command));
         persistEntry(log.entryAt(index));
         matchIndex.put(nodeId, index); // leader trivially has it
-        sendHeartbeats();
-        advanceCommitIndex();
+        advanceCommitIndex(); // a single-node cluster commits immediately
         return index;
+    }
+
+    /** Hands per-peer replication to a {@link RaftReplicationDriver}; ticks then only run elections. */
+    void delegateReplication(boolean delegated) {
+        this.replicationDelegated = delegated;
     }
 
     /**
