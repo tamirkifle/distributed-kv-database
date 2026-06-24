@@ -45,7 +45,12 @@ message GetRequest {
 
 message GetResponse {
   bool found = 1;
+  // The resolved value. Unset when siblings holds more than one entry: the key exists but the
+  // cluster cannot pick a winner, and a scalar field cannot express that.
   VersionedValuePb value = 2;
+  // Every value the read observed. One entry in the ordinary case; more than one means the caller
+  // must resolve the conflict and write back, as Riak's HTTP 300 Multiple Choices does.
+  repeated VersionedValuePb siblings = 3;
 }
 
 message PutRequest {
@@ -82,7 +87,10 @@ message ReplicaGetRequest {
 
 message ReplicaGetResponse {
   bool found = 1;
+  // Retained for single-value reads; siblings is authoritative.
   VersionedValuePb value = 2;
+  // Every value this replica holds for the key: empty if absent, more than one if conflicted.
+  repeated VersionedValuePb siblings = 3;
 }
 
 message ReplicaPutRequest {

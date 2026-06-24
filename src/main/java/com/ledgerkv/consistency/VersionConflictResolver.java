@@ -43,6 +43,18 @@ public final class VersionConflictResolver {
         return proposedValue;
     }
 
+    /**
+     * The causal frontier of {@code values}: every version that no other version happens after,
+     * with duplicates collapsed and a deterministic order. One survivor means the conflict resolves
+     * to it; more than one means the versions are genuinely concurrent.
+     *
+     * <p>Exposed so a caller that is about to <em>write</em> (read repair) can resolve causally
+     * first, instead of picking a scalar maximum that cannot order concurrent clocks.
+     */
+    public static List<VersionedValue> causalFrontier(List<VersionedValue> values) {
+        return survivingVersions(values);
+    }
+
     private static List<VersionedValue> survivingVersions(List<VersionedValue> values) {
         Objects.requireNonNull(values, "values must not be null");
 

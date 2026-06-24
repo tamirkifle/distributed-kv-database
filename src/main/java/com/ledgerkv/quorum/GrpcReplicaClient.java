@@ -2,8 +2,9 @@ package com.ledgerkv.quorum;
 
 import com.ledgerkv.VersionedValue;
 import com.ledgerkv.transport.NodeClient;
+import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
+import java.util.stream.Collectors;
 
 /**
  * A {@link ReplicaClient} that reaches a remote node over gRPC via {@link NodeClient}'s internal
@@ -28,8 +29,10 @@ public final class GrpcReplicaClient implements ReplicaClient {
     }
 
     @Override
-    public Optional<VersionedValue> get(String key) {
-        return client.replicaGet(key).map(ReplicaValues::fromStored);
+    public List<VersionedValue> get(String key) {
+        return client.replicaGet(key).stream()
+                .map(ReplicaValues::fromStored)
+                .collect(Collectors.toList());
     }
 
     @Override

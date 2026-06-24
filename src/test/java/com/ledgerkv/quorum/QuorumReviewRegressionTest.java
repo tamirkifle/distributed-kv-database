@@ -1,0 +1,350 @@
+package com.ledgerkv.quorum;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import com.ledgerkv.QuorumConfig;
+import com.ledgerkv.QuorumResponse;
+import com.ledgerkv.VersionedValue;
+import com.ledgerkv.consistency.VersionMetadata;
+import com.ledgerkv.node.QuorumClientCoordinator;
+import com.ledgerkv.storage.lsm.LsmEngine;
+import com.ledgerkv.transport.ConflictingValuesException;
+import com.ledgerkv.transport.NodeClient;
+import com.ledgerkv.transport.NodeServer;
+import com.ledgerkv.transport.StoredValue;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+/**
+ * Regressions for the leaderless-quorum bugs found reviewing commit {@code 4264fd2}, ported
+ * from the reviewer's own counterexamples.
+ *
+ * <p>Three of them share one root cause: a replica that can hold only a single value, and so
+ * has to discard one of two concurrent writes. Two more are bugs in the coordinator-side clock
+ * map, which is now deleted. The rest are the unreplicated delete, completion at W, and
+ * primary-only quorum counts.
+ */
+class QuorumReviewRegressionTest {
+
+    @TempDir
+    Path dir;
+
+    /** A replica decorator that can be made unavailable for reads or writes independently. */
+    static final class ControlledReplica implements ReplicaClient {
+
+        final ReplicaClient delegate;
+        volatile boolean readAvailable = true;
+        volatile boolean writeAvailable = true;
+        volatile CountDownLatch holdPut;
+        volatile CountDownLatch wrote;
+
+        ControlledReplica(ReplicaClient delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public String nodeId() {
+            return delegate.nodeId();
+        }
+
+        @Override
+        public List<VersionedValue> get(String key) {
+            if (!readAvailable) {
+                throw new IllegalStateException("read unavailable");
+            }
+            return delegate.get(key);
+        }
+
+        @Override
+        public void put(String key, VersionedValue value) {
+            if (!writeAvailable) {
+                throw new IllegalStateException("write unavailable");
+            }
+            await(holdPut);
+            delegate.put(key, value);
+            if (wrote != null) {
+                wrote.countDown();
+            }
+        }
+
+        @Override
+        public void deliverHint(String key, VersionedValue value) {
+            if (!writeAvailable) {
+                throw new IllegalStateException("hint unavailable");
+            }
+            delegate.deliverHint(key, value);
+        }
+
+        static void await(CountDownLatch latch) {
+            if (latch == null) {
+                return;
+            }
+            try {
+                if (!latch.await(10, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("test gate timed out");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    /** A cluster of real LSM- or gRPC-backed replicas behind controllable decorators. */
+    static final class Fixture implements AutoCloseable {
+
+        final ClusterMembership membership;
+        final List<LsmEngine> engines = new ArrayList<>();
+        final List<NodeServer> servers = new ArrayList<>();
+        final List<NodeClient> wireClients = new ArrayList<>();
+        final List<ControlledReplica> nodes = new ArrayList<>();
+        final Map<String, ReplicaClient> replicas = new LinkedHashMap<>();
+        final ExecutorService fanout = Executors.newCachedThreadPool();
+
+        Fixture(Path base, int count, int replication, boolean grpc) throws Exception {
+            membership = ClusterMembership.create("review", count, replication);
+            for (int i = 0; i < count; i++) {
+                String id = membership.getNodes().get(i).getId();
+                ReplicaClient delegate;
+                if (grpc) {
+                    NodeServer server =
+                        NodeServer.builder(0).dataDir(base.resolve("node-" + i)).build().start();
+                    servers.add(server);
+                    NodeClient client = NodeClient.connect("localhost", server.port());
+                    wireClients.add(client);
+                    delegate = new GrpcReplicaClient(id, client);
+                } else {
+                    LsmEngine engine = LsmEngine.open(base.resolve("node-" + i));
+                    engines.add(engine);
+                    delegate = new LocalReplicaClient(id, engine);
+                }
+                ControlledReplica node = new ControlledReplica(delegate);
+                nodes.add(node);
+                replicas.put(id, node);
+            }
+        }
+
+        LeaderlessKVCluster quorum(int w, int r) {
+            return LeaderlessKVCluster.create(membership,
+                new QuorumConfig(membership.getReplicationFactor(), w, r), replicas, fanout,
+                Duration.ofSeconds(5), Duration.ZERO);
+        }
+
+        /** Two causally concurrent values, written by different authors, split across replicas. */
+        void seedConflicts() {
+            VersionedValue a = new VersionedValue("branch-a", 1, VersionMetadata.initial("writer-a"));
+            VersionedValue b = new VersionedValue("branch-b", 1, VersionMetadata.initial("writer-b"));
+            nodes.get(0).put("k", a);
+            nodes.get(1).put("k", b);
+            nodes.get(2).put("k", a);
+        }
+
+        @Override
+        public void close() throws Exception {
+            fanout.shutdownNow();
+            fanout.awaitTermination(5, TimeUnit.SECONDS);
+            for (NodeClient client : wireClients) {
+                client.close();
+            }
+            for (NodeServer server : servers) {
+                server.close();
+            }
+            for (LsmEngine engine : engines) {
+                engine.close();
+            }
+        }
+    }
+
+    /**
+     * Replica storage accepted every arrival unconditionally, so replaying a hint
+     * carrying v1 against a replica that had since accepted v2 rolled it back to v1.
+     */
+    @Test
+    void oldHintMustNotOverwriteANewerAcknowledgedValue() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            LeaderlessKVCluster q = f.quorum(2, 3);
+            f.nodes.get(2).writeAvailable = false;
+            assertTrue(q.write(0, "k", "v1").isSuccessful());
+            assertEquals(1, q.getPendingHints().size());
+
+            f.nodes.get(2).writeAvailable = true;
+            assertTrue(q.write(0, "k", "v2").isSuccessful());
+            assertEquals("v2", single(f.nodes.get(2).get("k")).getValue());
+
+            assertEquals(1, q.replayPendingHints().getAppliedCount());
+
+            assertEquals("v2", single(f.nodes.get(2).get("k")).getValue(),
+                "a delayed v1 hint overwrote the causally newer v2 on a real LSM replica");
+        }
+    }
+
+    /** The same guard on the gRPC transport, which had an identical unconditional write path. */
+    @Test
+    void oldHintMustNotOverwriteANewerValueOverGrpc() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, true)) {
+            LeaderlessKVCluster q = f.quorum(2, 3);
+            f.nodes.get(2).writeAvailable = false;
+            assertTrue(q.write(0, "k", "v1").isSuccessful());
+            f.nodes.get(2).writeAvailable = true;
+            assertTrue(q.write(0, "k", "v2").isSuccessful());
+
+            assertEquals(1, q.replayPendingHints().getAppliedCount());
+
+            assertEquals("v2", single(f.nodes.get(2).get("k")).getValue());
+        }
+    }
+
+    /** A replica keeps two genuinely concurrent writes rather than letting the later one win. */
+    @Test
+    void replicaKeepsConcurrentSiblingsRatherThanOverwriting() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            ControlledReplica replica = f.nodes.get(0);
+            replica.put("k", new VersionedValue("branch-a", 1, VersionMetadata.initial("writer-a")));
+            replica.put("k", new VersionedValue("branch-b", 1, VersionMetadata.initial("writer-b")));
+
+            List<VersionedValue> held = replica.get("k");
+
+            assertEquals(2, held.size(), "concurrent clocks must both survive at the replica");
+        }
+    }
+
+    /** Redelivering the identical write is idempotent, not a second sibling. */
+    @Test
+    void redeliveringTheSameValueIsIdempotent() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            ControlledReplica replica = f.nodes.get(0);
+            VersionedValue value =
+                new VersionedValue("v", 1, VersionMetadata.initial("writer-a"));
+            replica.put("k", value);
+            replica.put("k", value);
+
+            assertEquals(1, replica.get("k").size());
+        }
+    }
+
+    /**
+     * Repair chose a winner by scalar version — which cannot order two concurrent
+     * vector clocks, since their counter sums are equal — and copied it over the other branch. The
+     * conflict did not get resolved, it got deleted.
+     */
+    @Test
+    void repairMustNotDiscardUnresolvedConcurrentSiblings() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            f.seedConflicts();
+            LeaderlessKVCluster q = f.quorum(2, 3);
+            assertEquals(2, q.read(0, "k").getConflictingValues().size());
+
+            QuorumResponse repaired = q.repair(0, "k");
+
+            assertTrue(repaired.hasConflicts(), "repair must report the unresolved conflict");
+            assertEquals(2, q.read(0, "k").getConflictingValues().size(),
+                "repair replaced concurrent siblings with a scalar-version winner");
+        }
+    }
+
+    /** Repair still does its job when the versions are causally ordered: the newest wins. */
+    @Test
+    void repairStillPropagatesACausallyDominantValue() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            LeaderlessKVCluster q = f.quorum(2, 3);
+            f.nodes.get(2).writeAvailable = false;
+            assertTrue(q.write(0, "k", "v1").isSuccessful());
+            f.nodes.get(2).writeAvailable = true;
+
+            QuorumResponse repaired = q.repair(0, "k");
+
+            assertTrue(repaired.isSuccessful());
+            assertEquals("v1", repaired.getValue().getValue());
+            assertEquals("v1", single(f.nodes.get(2).get("k")).getValue(),
+                "the lagging replica must be brought up to date");
+        }
+    }
+
+    /**
+     * {@code QuorumResponse} returns a null winner when it holds unresolved
+     * siblings, and the public coordinator read that null as absence — so a caller could not tell a
+     * conflicted key from a missing one.
+     */
+    @Test
+    void publicGrpcReadMustNotReportConflictsAsMissing() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, true)) {
+            f.seedConflicts();
+            LeaderlessKVCluster q = f.quorum(2, 3);
+            assertTrue(q.read(0, "k").hasConflicts());
+            f.servers.get(0).useCoordinator(new QuorumClientCoordinator(q, 0));
+            NodeClient client = f.wireClients.get(0);
+
+            List<StoredValue> siblings = client.getSiblings("k");
+
+            assertEquals(2, siblings.size(),
+                "the public RPC must carry both concurrent values");
+            ConflictingValuesException conflict =
+                assertThrows(ConflictingValuesException.class, () -> client.get("k"));
+            assertEquals(2, conflict.siblings().size());
+        }
+    }
+
+    /** A genuinely absent key is still absent — the conflict signal must not swallow that case. */
+    @Test
+    void publicGrpcReadStillReportsAMissingKeyAsAbsent() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, true)) {
+            LeaderlessKVCluster q = f.quorum(2, 3);
+            f.servers.get(0).useCoordinator(new QuorumClientCoordinator(q, 0));
+
+            Optional<byte[]> value = f.wireClients.get(0).get("never-written");
+
+            assertTrue(value.isEmpty());
+            assertTrue(f.wireClients.get(0).getSiblings("never-written").isEmpty());
+        }
+    }
+
+    /** The review's passing control: the core read path preserves conflicts as documented. */
+    @Test
+    void coreReadPreservesConflictsAsDocumented() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            f.seedConflicts();
+
+            QuorumResponse read = f.quorum(2, 3).read(0, "k");
+
+            assertTrue(read.isSuccessful());
+            assertTrue(read.hasConflicts());
+            assertNull(read.getValue());
+            assertEquals(2, read.getConflictingValues().size());
+        }
+    }
+
+    /** The review's other passing control: a strict replica set survives one unavailable node. */
+    @Test
+    void strictReplicaQuorumSurvivesOneUnavailableNode() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            LeaderlessKVCluster q = f.quorum(2, 2);
+            f.nodes.get(2).writeAvailable = false;
+            f.nodes.get(2).readAvailable = false;
+
+            assertTrue(q.write(0, "k", "v1").isSuccessful());
+            QuorumResponse read = q.read(0, "k");
+
+            assertTrue(read.isSuccessful());
+            assertEquals("v1", read.getValue().getValue());
+        }
+    }
+
+    private static VersionedValue single(List<VersionedValue> values) {
+        assertEquals(1, values.size(), "expected exactly one value, got " + values);
+        return values.get(0);
+    }
+}

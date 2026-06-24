@@ -8,6 +8,7 @@ import com.ledgerkv.VersionedValue;
 import com.ledgerkv.consistency.VersionMetadata;
 import com.ledgerkv.storage.lsm.LsmEngine;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Optional;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -41,12 +42,12 @@ class LocalReplicaClientTest {
         VersionMetadata clock = VersionMetadata.initial("n0");
         client.put("k", new VersionedValue("v", 3, clock));
 
-        Optional<VersionedValue> read = client.get("k");
-        assertTrue(read.isPresent());
-        assertEquals("v", read.get().getValue());
-        assertEquals(3, read.get().getVersion());
-        assertEquals(clock.getVectorClock(), read.get().getVersionMetadata().getVectorClock());
-        assertFalse(client.get("absent").isPresent());
+        List<VersionedValue> read = client.get("k");
+        assertEquals(1, read.size());
+        assertEquals("v", read.get(0).getValue());
+        assertEquals(3, read.get(0).getVersion());
+        assertEquals(clock.getVectorClock(), read.get(0).getVersionMetadata().getVectorClock());
+        assertTrue(client.get("absent").isEmpty());
     }
 
     @Test
@@ -55,9 +56,9 @@ class LocalReplicaClientTest {
         VersionMetadata clock = VersionMetadata.initial("nA").increment("nB");
         client.deliverHint("k2", new VersionedValue("v2", 5, clock));
 
-        Optional<VersionedValue> read = client.get("k2");
-        assertTrue(read.isPresent());
-        assertEquals("v2", read.get().getValue());
-        assertEquals(clock.getVectorClock(), read.get().getVersionMetadata().getVectorClock());
+        List<VersionedValue> read = client.get("k2");
+        assertEquals(1, read.size());
+        assertEquals("v2", read.get(0).getValue());
+        assertEquals(clock.getVectorClock(), read.get(0).getVersionMetadata().getVectorClock());
     }
 }

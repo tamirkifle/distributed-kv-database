@@ -109,7 +109,7 @@ final class QuorumStaleReadHarness {
         }
 
         @Override
-        public Optional<VersionedValue> get(String key) {
+        public java.util.List<VersionedValue> get(String key) {
             requireAvailable();
             return delegate.get(key);
         }

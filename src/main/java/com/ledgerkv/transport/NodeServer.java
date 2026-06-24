@@ -26,6 +26,7 @@ import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
@@ -112,10 +113,12 @@ public final class NodeServer implements AutoCloseable {
     private static final class LedgerKvNodeService extends LedgerKvNodeGrpc.LedgerKvNodeImplBase {
 
         private final LsmEngine engine;
+        private final ReplicaStore store;
         private volatile ClientCoordinator coordinator;
 
         LedgerKvNodeService(LsmEngine engine) {
             this.engine = engine;
+            this.store = new ReplicaStore(engine);
         }
 
         void setCoordinator(ClientCoordinator coordinator) {
@@ -127,9 +130,20 @@ public final class NodeServer implements AutoCloseable {
             ClientCoordinator coord = coordinator;
             if (coord != null) {
                 try {
-                    Optional<StoredValue> value = coord.get(request.getKey());
+                    List<StoredValue> values = coord.get(request.getKey());
                     GetResponse.Builder resp = GetResponse.newBuilder();
-                    value.ifPresent(v -> resp.setFound(true).setValue(VersionedValueProtos.toProto(v)));
+                    for (StoredValue value : values) {
+                        resp.addSiblings(VersionedValueProtos.toProto(value));
+                    }
+                    if (!values.isEmpty()) {
+                        // found is true whenever the key exists, conflicted or not. value carries a
+                        // winner only when there is exactly one, so a caller that reads the scalar
+                        // field can never mistake a conflict for a resolved value.
+                        resp.setFound(true);
+                        if (values.size() == 1) {
+                            resp.setValue(VersionedValueProtos.toProto(values.get(0)));
+                        }
+                    }
                     responseObserver.onNext(resp.build());
                     responseObserver.onCompleted();
                 } catch (RuntimeException e) {
@@ -138,11 +152,16 @@ public final class NodeServer implements AutoCloseable {
                 }
                 return;
             }
-            Optional<byte[]> stored = engine.get(request.getKey());
+            List<StoredValue> stored = store.get(request.getKey());
             GetResponse.Builder resp = GetResponse.newBuilder();
-            if (stored.isPresent()) {
-                StoredValue value = StoredValueCodec.decode(stored.get());
-                resp.setFound(true).setValue(VersionedValueProtos.toProto(value));
+            for (StoredValue value : stored) {
+                resp.addSiblings(VersionedValueProtos.toProto(value));
+            }
+            if (!stored.isEmpty()) {
+                resp.setFound(true);
+                if (stored.size() == 1) {
+                    resp.setValue(VersionedValueProtos.toProto(stored.get(0)));
+                }
             }
             responseObserver.onNext(resp.build());
             responseObserver.onCompleted();
@@ -169,7 +188,8 @@ public final class NodeServer implements AutoCloseable {
                     nextVersion,
                     false,
                     VersionMetadata.legacy(nextVersion));
-            engine.put(request.getKey(), StoredValueCodec.encode(value));
+            // Administrative single-node path: this write supersedes whatever was there.
+            store.replace(request.getKey(), java.util.Collections.singletonList(value));
             responseObserver.onNext(PutResponse.newBuilder().setVersion(nextVersion).build());
             responseObserver.onCompleted();
         }
@@ -193,7 +213,12 @@ public final class NodeServer implements AutoCloseable {
                         break;
                     }
                     Entry entry = entries.next();
-                    StoredValue value = StoredValueCodec.decode(entry.value());
+                    // A conflicted key streams its highest-versioned sibling; scan has no field to
+                    // carry a conflict, and inventing one is out of scope for a range read.
+                    List<StoredValue> siblings = StoredValueCodec.decodeAll(entry.value());
+                    StoredValue value = siblings.stream()
+                            .max(java.util.Comparator.comparingLong(StoredValue::version))
+                            .orElseThrow(() -> new IllegalStateException("empty sibling set"));
                     responseObserver.onNext(ScanEntry.newBuilder()
                             .setKey(entry.key())
                             .setValue(VersionedValueProtos.toProto(value))
@@ -207,11 +232,16 @@ public final class NodeServer implements AutoCloseable {
         @Override
         public void replicaGet(ReplicaGetRequest request,
                 StreamObserver<ReplicaGetResponse> responseObserver) {
-            Optional<byte[]> stored = engine.get(request.getKey());
+            List<StoredValue> stored = store.get(request.getKey());
             ReplicaGetResponse.Builder resp = ReplicaGetResponse.newBuilder();
-            if (stored.isPresent()) {
-                StoredValue value = StoredValueCodec.decode(stored.get());
-                resp.setFound(true).setValue(VersionedValueProtos.toProto(value));
+            for (StoredValue value : stored) {
+                resp.addSiblings(VersionedValueProtos.toProto(value));
+            }
+            if (!stored.isEmpty()) {
+                resp.setFound(true);
+                if (stored.size() == 1) {
+                    resp.setValue(VersionedValueProtos.toProto(stored.get(0)));
+                }
             }
             responseObserver.onNext(resp.build());
             responseObserver.onCompleted();
@@ -233,17 +263,19 @@ public final class NodeServer implements AutoCloseable {
             responseObserver.onCompleted();
         }
 
-        /** Persists the coordinator-supplied versioned value exactly as received (no re-versioning). */
+        /**
+         * Merges the coordinator-supplied versioned value into whatever this replica holds, under a
+         * per-key lock. The coordinator still owns versioning — the value is stored with the clock
+         * it arrived with — but a causally older or duplicate arrival no longer overwrites a newer
+         * one, and two concurrent values are both kept.
+         */
         private void storeVerbatim(String key, VersionedValuePb value) {
-            StoredValue stored = VersionedValueProtos.fromProto(value);
-            engine.put(key, StoredValueCodec.encode(stored));
+            store.merge(key, VersionedValueProtos.fromProto(value));
         }
 
-        /** The version of the current live value for {@code key}, or 0 if absent. */
+        /** The highest version currently stored for {@code key}, or 0 if absent. */
         private long currentVersion(String key) {
-            return engine.get(key)
-                    .map(bytes -> StoredValueCodec.decode(bytes).version())
-                    .orElse(0L);
+            return store.get(key).stream().mapToLong(StoredValue::version).max().orElse(0L);
         }
     }
 }

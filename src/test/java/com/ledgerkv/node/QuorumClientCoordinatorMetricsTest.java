@@ -103,7 +103,7 @@ class QuorumClientCoordinatorMetricsTest {
             }
 
             @Override
-            public Optional<VersionedValue> get(String key) {
+            public java.util.List<VersionedValue> get(String key) {
                 throw new RuntimeException("down");
             }
 

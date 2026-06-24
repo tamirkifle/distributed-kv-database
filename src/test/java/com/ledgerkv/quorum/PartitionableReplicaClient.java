@@ -1,8 +1,8 @@
 package com.ledgerkv.quorum;
 
 import com.ledgerkv.VersionedValue;
+import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 
 /**
  * Test double: a partition-injecting decorator over any {@link ReplicaClient}. When unavailable,
@@ -28,7 +28,7 @@ final class PartitionableReplicaClient implements ReplicaClient {
     }
 
     @Override
-    public Optional<VersionedValue> get(String key) {
+    public List<VersionedValue> get(String key) {
         requireAvailable();
         return delegate.get(key);
     }

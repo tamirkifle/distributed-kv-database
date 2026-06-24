@@ -5,6 +5,7 @@ import com.ledgerkv.QuorumResponse;
 import com.ledgerkv.VersionedValue;
 import com.ledgerkv.failure.FailureCause;
 import com.ledgerkv.failure.FailureContext;
+import com.ledgerkv.consistency.VersionConflictResolver;
 import com.ledgerkv.consistency.VersionMetadata;
 
 import java.time.Duration;
@@ -180,12 +181,22 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         return membership.getPreferenceList(key, membership.getReplicationFactor());
     }
 
-    public Optional<VersionedValue> getReplicaValue(String nodeId, String key) {
+    /** Every value {@code nodeId} holds for {@code key}: empty if absent, many if conflicted. */
+    public List<VersionedValue> getReplicaValues(String nodeId, String key) {
         ReplicaClient client = clientsByNodeId.get(nodeId);
         if (client == null) {
-            return Optional.empty();
+            return List.of();
         }
         return client.get(key);
+    }
+
+    /**
+     * The single value {@code nodeId} holds for {@code key}, or empty when it is absent <em>or</em>
+     * that replica holds unresolved siblings — a scalar accessor cannot represent a conflict.
+     */
+    public Optional<VersionedValue> getReplicaValue(String nodeId, String key) {
+        List<VersionedValue> values = getReplicaValues(nodeId, key);
+        return values.size() == 1 ? Optional.of(values.get(0)) : Optional.empty();
     }
 
     public List<HintedHandoff> getPendingHints() {
@@ -369,7 +380,13 @@ public final class LeaderlessKVCluster implements AutoCloseable {
                 }
                 completedCount++;
                 if (result.ok && !responded.contains(result.nodeId)) {
-                    values.add(result.value);
+                    // A replica contributes every value it holds, so a conflict that exists on one
+                    // replica reaches the reader instead of being flattened at the transport.
+                    if (result.values.isEmpty()) {
+                        values.add(null); // this replica has no value for the key
+                    } else {
+                        values.addAll(result.values);
+                    }
                     responded.add(result.nodeId);
                     failureContext.responded(result.nodeId);
                 }
@@ -413,7 +430,7 @@ public final class LeaderlessKVCluster implements AutoCloseable {
             String nodeId = replica.getId();
             readFutures.add(completion.submit(() -> {
                 try {
-                    return ReplicaResult.ok(nodeId, clientsByNodeId.get(nodeId).get(key).orElse(null));
+                    return ReplicaResult.ok(nodeId, clientsByNodeId.get(nodeId).get(key));
                 } catch (RuntimeException e) {
                     return ReplicaResult.failed(nodeId);
                 }
@@ -422,7 +439,7 @@ public final class LeaderlessKVCluster implements AutoCloseable {
 
         List<VersionedValue> values = new ArrayList<>();
         FailureContext.Builder failureContext = FailureContext.builder();
-        Map<String, VersionedValue> currentByNode = new LinkedHashMap<>();
+        Map<String, List<VersionedValue>> currentByNode = new LinkedHashMap<>();
         int completedCount = 0;
         try {
             while (completedCount < replicas.size()) {
@@ -432,8 +449,12 @@ public final class LeaderlessKVCluster implements AutoCloseable {
                 }
                 completedCount++;
                 if (result.ok) {
-                    values.add(result.value);
-                    currentByNode.put(result.nodeId, result.value);
+                    if (result.values.isEmpty()) {
+                        values.add(null);
+                    } else {
+                        values.addAll(result.values);
+                    }
+                    currentByNode.put(result.nodeId, result.values);
                     failureContext.responded(result.nodeId);
                 } else {
                     failureContext.failed(result.nodeId, FailureCause.UNAVAILABLE_NODE);
@@ -443,34 +464,39 @@ public final class LeaderlessKVCluster implements AutoCloseable {
             cancelAll(readFutures);
         }
 
-        VersionedValue latest = values.stream()
+        // Resolve causally BEFORE touching storage. Picking a winner by scalar version cannot order
+        // two concurrent vector clocks — the counter sums are frequently equal — so the previous
+        // max-by-version choice was effectively decided by which response arrived first, and then
+        // written over the other branch.
+        List<VersionedValue> observed = values.stream()
             .filter(Objects::nonNull)
-            .max(Comparator.comparingLong(VersionedValue::getVersion))
-            .orElse(null);
+            .collect(java.util.stream.Collectors.toList());
+        List<VersionedValue> frontier = VersionConflictResolver.causalFrontier(observed);
+        VersionedValue latest = frontier.size() == 1 ? frontier.get(0) : null;
 
         if (latest != null) {
-            // Phase 2: push the freshest value to replicas whose current value differs, concurrently
-            // within the same deadline budget. Repair writes do not gate the response (matches prior
-            // behavior); failures only mark the failure context.
+            // Phase 2: push the single causally dominant value to replicas that do not already hold
+            // exactly it, concurrently within the same deadline budget. Repair writes do not gate
+            // the response (matches prior behavior); failures only mark the failure context.
             long repairDeadlineNanos = System.nanoTime() + requestDeadline.toNanos();
             List<Future<ReplicaResult>> repairFutures = new ArrayList<>();
             for (ClusterNode replica : replicas) {
                 String nodeId = replica.getId();
-                VersionedValue current = currentByNode.get(nodeId);
-                if (currentByNode.containsKey(nodeId) && current != null && sameStoredValue(current, latest)) {
+                List<VersionedValue> current = currentByNode.get(nodeId);
+                if (current != null && current.size() == 1 && sameStoredValue(current.get(0), latest)) {
                     continue; // already up to date
                 }
                 VersionedValue toWrite = latest;
                 repairFutures.add(executor.submit(() -> {
                     clientsByNodeId.get(nodeId).put(key, toWrite);
-                    return ReplicaResult.ok(nodeId, null);
+                    return ReplicaResult.written(nodeId);
                 }));
             }
             awaitRepairWrites(repairFutures, repairDeadlineNanos);
-            // Repair adopts the freshest observed clock (it does not mint a new version); a plain
-            // atomic put on the concurrent map is correct here.
-            versionMetadataByKey.put(key, latest.getVersionMetadata());
         }
+        // When the frontier holds more than one value the conflict is genuinely unresolved. Repair
+        // reports it and writes nothing: siblings are the reader's to resolve, and collapsing them
+        // here would destroy a branch no one ever chose to discard.
 
         boolean successful = !values.isEmpty();
         return new QuorumResponse(successful, latest, values, values.size(),
@@ -483,7 +509,7 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         return completion.submit(() -> {
             try {
                 clientsByNodeId.get(nodeId).put(key, value);
-                return ReplicaResult.ok(nodeId, null);
+                return ReplicaResult.written(nodeId);
             } catch (RuntimeException e) {
                 return ReplicaResult.failed(nodeId);
             }
@@ -495,7 +521,7 @@ public final class LeaderlessKVCluster implements AutoCloseable {
                                             String nodeId, String key) {
         return completion.submit(() -> {
             try {
-                return ReplicaResult.ok(nodeId, clientsByNodeId.get(nodeId).get(key).orElse(null));
+                return ReplicaResult.ok(nodeId, clientsByNodeId.get(nodeId).get(key));
             } catch (RuntimeException e) {
                 return ReplicaResult.failed(nodeId);
             }
@@ -617,24 +643,32 @@ public final class LeaderlessKVCluster implements AutoCloseable {
             && left.getVersionMetadata().equals(right.getVersionMetadata());
     }
 
-    /** Carrier for a single replica's fan-out outcome. */
+    /**
+     * Carrier for a single replica's fan-out outcome. {@code values} holds every value that replica
+     * returned — empty when the key is absent there, more than one when that replica itself holds
+     * unresolved siblings.
+     */
     private static final class ReplicaResult {
         final String nodeId;
         final boolean ok;
-        final VersionedValue value;
+        final List<VersionedValue> values;
 
-        private ReplicaResult(String nodeId, boolean ok, VersionedValue value) {
+        private ReplicaResult(String nodeId, boolean ok, List<VersionedValue> values) {
             this.nodeId = nodeId;
             this.ok = ok;
-            this.value = value;
+            this.values = values;
         }
 
-        static ReplicaResult ok(String nodeId, VersionedValue value) {
-            return new ReplicaResult(nodeId, true, value);
+        static ReplicaResult ok(String nodeId, List<VersionedValue> values) {
+            return new ReplicaResult(nodeId, true, values);
+        }
+
+        static ReplicaResult written(String nodeId) {
+            return new ReplicaResult(nodeId, true, List.of());
         }
 
         static ReplicaResult failed(String nodeId) {
-            return new ReplicaResult(nodeId, false, null);
+            return new ReplicaResult(nodeId, false, List.of());
         }
     }
 }

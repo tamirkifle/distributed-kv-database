@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.ledgerkv.consistency.VersionMetadata;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Optional;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -49,9 +50,9 @@ class ReplicaRpcLoopbackTest {
         VersionMetadata clock = VersionMetadata.initial("nodeA").increment("nodeB");
         client.replicaPut("k", new StoredValue("v".getBytes(UTF_8), 5, false, clock));
 
-        Optional<StoredValue> read = client.replicaGet("k");
-        assertTrue(read.isPresent());
-        StoredValue value = read.get();
+        List<StoredValue> read = client.replicaGet("k");
+        assertEquals(1, read.size());
+        StoredValue value = read.get(0);
         assertArrayEquals("v".getBytes(UTF_8), value.value());
         assertEquals(5, value.version());
         assertFalse(value.tombstone());
@@ -63,15 +64,15 @@ class ReplicaRpcLoopbackTest {
         VersionMetadata clock = VersionMetadata.initial("nodeA");
         client.deliverHint("itest-node-1", "h", new StoredValue("hv".getBytes(UTF_8), 2, false, clock));
 
-        Optional<StoredValue> read = client.replicaGet("h");
-        assertTrue(read.isPresent());
-        assertArrayEquals("hv".getBytes(UTF_8), read.get().value());
-        assertEquals(2, read.get().version());
-        assertEquals(clock.getVectorClock(), read.get().metadata().getVectorClock());
+        List<StoredValue> read = client.replicaGet("h");
+        assertEquals(1, read.size());
+        assertArrayEquals("hv".getBytes(UTF_8), read.get(0).value());
+        assertEquals(2, read.get(0).version());
+        assertEquals(clock.getVectorClock(), read.get(0).metadata().getVectorClock());
     }
 
     @Test
     void replicaGetAbsentReturnsEmpty() {
-        assertFalse(client.replicaGet("missing").isPresent());
+        assertTrue(client.replicaGet("missing").isEmpty());
     }
 }

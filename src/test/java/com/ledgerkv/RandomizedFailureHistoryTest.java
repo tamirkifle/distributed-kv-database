@@ -209,7 +209,7 @@ class RandomizedFailureHistoryTest {
         }
 
         @Override
-        public Optional<VersionedValue> get(String key) {
+        public java.util.List<VersionedValue> get(String key) {
             failures.throwIfUnavailable(nodeId);
             return delegate.get(key);
         }

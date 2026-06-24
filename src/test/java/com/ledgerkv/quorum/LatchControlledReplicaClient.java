@@ -1,8 +1,8 @@
 package com.ledgerkv.quorum;
 
 import com.ledgerkv.VersionedValue;
+import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 
 /**
@@ -36,7 +36,7 @@ public final class LatchControlledReplicaClient implements ReplicaClient {
     }
 
     @Override
-    public Optional<VersionedValue> get(String key) {
+    public List<VersionedValue> get(String key) {
         await();
         return delegate.get(key);
     }

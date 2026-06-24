@@ -13,6 +13,7 @@ import com.ledgerkv.transport.proto.ReplicaGetResponse;
 import com.ledgerkv.transport.proto.ReplicaPutRequest;
 import com.ledgerkv.transport.proto.ScanEntry;
 import com.ledgerkv.transport.proto.ScanRequest;
+import com.ledgerkv.transport.proto.VersionedValuePb;
 import io.grpc.ManagedChannel;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
 import java.util.ArrayList;
@@ -43,13 +44,37 @@ public final class NodeClient implements AutoCloseable {
         return new NodeClient(channel);
     }
 
-    /** Returns the value for {@code key}, or empty if absent. */
+    /**
+     * Returns the value for {@code key}, or empty if absent.
+     *
+     * @throws ConflictingValuesException when the key holds concurrent siblings — an Optional
+     *     cannot represent "exists, with two competing values", and reporting that as empty made a
+     *     live key look missing. Callers that want to resolve
+     *     the conflict use {@link #getSiblings(String)}.
+     */
     public Optional<byte[]> get(String key) {
-        GetResponse response = stub.get(GetRequest.newBuilder().setKey(key).build());
-        if (!response.getFound()) {
+        List<StoredValue> siblings = getSiblings(key);
+        if (siblings.isEmpty()) {
             return Optional.empty();
         }
-        return Optional.of(response.getValue().getValue().toByteArray());
+        if (siblings.size() > 1) {
+            throw new ConflictingValuesException(key, siblings);
+        }
+        return Optional.of(siblings.get(0).value());
+    }
+
+    /**
+     * Every value the cluster holds for {@code key}: empty if absent, one in the ordinary case, and
+     * more than one when concurrent writes have not been reconciled. The analogue of Riak returning
+     * HTTP 300 Multiple Choices with the sibling list.
+     */
+    public List<StoredValue> getSiblings(String key) {
+        GetResponse response = stub.get(GetRequest.newBuilder().setKey(key).build());
+        List<StoredValue> siblings = new ArrayList<>();
+        for (VersionedValuePb sibling : response.getSiblingsList()) {
+            siblings.add(VersionedValueProtos.fromProto(sibling));
+        }
+        return siblings;
     }
 
     /** Writes {@code value} under {@code key}; returns the assigned version. */
@@ -80,14 +105,18 @@ public final class NodeClient implements AutoCloseable {
         return entries;
     }
 
-    /** Internal replica read: returns the stored versioned value for {@code key}, or empty. */
-    public Optional<StoredValue> replicaGet(String key) {
+    /**
+     * Internal replica read: every value the replica holds for {@code key} — empty if absent, more
+     * than one if that replica holds concurrent siblings.
+     */
+    public List<StoredValue> replicaGet(String key) {
         ReplicaGetResponse response =
                 stub.replicaGet(ReplicaGetRequest.newBuilder().setKey(key).build());
-        if (!response.getFound()) {
-            return Optional.empty();
+        List<StoredValue> siblings = new ArrayList<>();
+        for (VersionedValuePb sibling : response.getSiblingsList()) {
+            siblings.add(VersionedValueProtos.fromProto(sibling));
         }
-        return Optional.of(VersionedValueProtos.fromProto(response.getValue()));
+        return siblings;
     }
 
     /** Internal replica write: stores {@code value} under {@code key} verbatim (no re-versioning). */

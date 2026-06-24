@@ -8,8 +8,9 @@ import com.ledgerkv.metrics.OperationMetricsCollector;
 import com.ledgerkv.transport.ClientCoordinator;
 import com.ledgerkv.transport.StoredValue;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 
 /**
  * Adapts a {@link LeaderlessKVCluster} (the leaderless quorum coordinator) to the transport-layer
@@ -33,7 +34,7 @@ public final class QuorumClientCoordinator implements ClientCoordinator {
     }
 
     @Override
-    public Optional<StoredValue> get(String key) {
+    public List<StoredValue> get(String key) {
         long hedgesBefore = cluster.hedgedRequestCount();
         QuorumResponse response = cluster.read(coordinatorIndex, key);
         metricsCollector.recordRead(response);
@@ -41,11 +42,21 @@ public final class QuorumClientCoordinator implements ClientCoordinator {
         if (!response.isSuccessful()) {
             throw new IllegalStateException("read quorum not met for key " + key);
         }
-        VersionedValue value = response.getValue();
-        if (value == null) {
-            return Optional.empty();
+        List<StoredValue> values = new ArrayList<>();
+        if (response.hasConflicts()) {
+            // The key exists with concurrent values. Returning them is what lets the caller tell a
+            // conflict from an absence; reporting the null winner as empty made a live key look
+            // missing.
+            for (VersionedValue sibling : response.getConflictingValues()) {
+                values.add(toStored(sibling));
+            }
+            return values;
         }
-        return Optional.of(toStored(value));
+        VersionedValue value = response.getValue();
+        if (value != null) {
+            values.add(toStored(value));
+        }
+        return values;
     }
 
     @Override
