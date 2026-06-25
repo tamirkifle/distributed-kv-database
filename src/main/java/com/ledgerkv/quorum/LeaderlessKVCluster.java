@@ -61,7 +61,18 @@ public final class LeaderlessKVCluster implements AutoCloseable {
     private final ClusterMembership membership;
     private final QuorumConfig config;
     private final Map<String, ReplicaClient> clientsByNodeId;
-    private final ConcurrentMap<String, VersionMetadata> versionMetadataByKey;
+    /**
+     * The highest clock this coordinator has issued per key. Not a source of truth — the durable
+     * context read from the replicas is — but a monotonicity guard with two jobs the read alone
+     * cannot do: it serializes concurrent writers on this coordinator (the update is one atomic
+     * {@code compute}, so two writes to the same key can never be stamped with the same counter),
+     * and it covers the window before a just-issued write is visible to a subsequent context read.
+     *
+     * <p>Merged with the observed context and only ever advanced, so it cannot rewind a clock the
+     * way the old authoritative map did. Losing an entry is safe: the observed context takes over,
+     * which is exactly what happens after a restart.
+     */
+    private final ConcurrentMap<String, VersionMetadata> issuedClocks = new ConcurrentHashMap<>();
     private final List<HintedHandoff> pendingHints;
     /** Guards the multi-step clear+refill in {@link #replayPendingHints()} against concurrent adds. */
     private final Object hintsLock = new Object();
@@ -88,7 +99,6 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         }
         this.ownsExecutor = ownsExecutor;
         this.clientsByNodeId = new LinkedHashMap<>();
-        this.versionMetadataByKey = new ConcurrentHashMap<>();
         this.pendingHints = new ArrayList<>();
         for (ClusterNode node : membership.getNodes()) {
             ReplicaClient client = clientsByNodeId.get(node.getId());
@@ -212,18 +222,45 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         long startNanos = System.nanoTime();
         long deadlineNanos = startNanos + requestDeadline.toNanos();
         String coordinatorNodeId = membership.getNodes().get(coordinatorIndex).getId();
-        // Atomically read-modify-write the per-key vector clock so concurrent writers on the same key
-        // cannot lose an increment (the prior get-then-put was a lost-update race). compute() holds the
-        // bucket lock; the lambda is pure (no I/O), so holding it briefly is safe. The clock advances
-        // even when the write later fails to reach W: a failed write may already have landed on some
-        // replicas (which become hinted handoffs carrying this clock), so a later write must not reuse
-        // it — that would let two distinct values share one version.
-        VersionMetadata nextMetadata = versionMetadataByKey.compute(key, (k, current) ->
-            current == null ? VersionMetadata.initial(coordinatorNodeId)
-                            : current.increment(coordinatorNodeId));
+        List<ClusterNode> replicas = selectReplicas(key);
+
+        // Derive the new version from what the replicas actually hold, the way Riak's coordinating
+        // vnode does: read the current object, merge its causal context, and increment this
+        // coordinator's own entry in that clock. The counter therefore lives in the data.
+        //
+        // It used to live in a per-key map on this object, which is what made both of the version
+        // bugs possible: the map started empty on restart, so a restarted coordinator reissued
+        // counter 1 while a surviving replica still held counter 2 and won the comparison; and
+        // read repair overwrote the map with metadata it had read earlier, rewinding a
+        // concurrent writer's clock. Deleting the map removes both.
+        CausalContext context = readCausalContext(key, replicas, deadlineNanos);
+        if (!context.quorumMet) {
+            // Without a read quorum this coordinator cannot know which counters are already in use,
+            // and guessing is what produced the counter-reuse bug on restart. Refuse rather
+            // than reissue.
+            FailureContext.Builder contextFailure = FailureContext.builder();
+            for (ClusterNode replica : replicas) {
+                contextFailure.failed(replica.getId(), FailureCause.UNAVAILABLE_NODE);
+            }
+            return new QuorumResponse(false, null, List.of(), context.responded, config.getW(),
+                elapsedMs(startNanos), contextFailure.build());
+        }
+        VersionMetadata observed = context.metadata;
+        VersionMetadata nextMetadata = issuedClocks.compute(key, (k, lastIssued) -> {
+            VersionMetadata base;
+            if (observed == null) {
+                base = lastIssued;
+            } else if (lastIssued == null) {
+                base = observed;
+            } else {
+                base = observed.merge(lastIssued); // componentwise max: never moves backwards
+            }
+            return base == null
+                ? VersionMetadata.initial(coordinatorNodeId)
+                : base.increment(coordinatorNodeId);
+        });
         VersionedValue versionedValue = new VersionedValue(value, versionFor(nextMetadata), nextMetadata);
 
-        List<ClusterNode> replicas = selectReplicas(key);
         List<ClusterNode> hedgeCandidates = hedgeCandidates(key, replicas.size());
         ExecutorCompletionService<ReplicaResult> completion = new ExecutorCompletionService<>(executor);
         List<Future<ReplicaResult>> futures = new ArrayList<>();
@@ -501,6 +538,62 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         boolean successful = !values.isEmpty();
         return new QuorumResponse(successful, latest, values, values.size(),
             config.getN(), elapsedMs(startNanos), failureContext.build());
+    }
+
+    /**
+     * Reads the current causal context for {@code key} from its replica set: the componentwise
+     * merge of every vector clock the replicas hold, which is the clock a new write must descend
+     * from. Returns as soon as {@code R} replicas have answered.
+     *
+     * <p>This is the extra round trip that durable version allocation costs here. Riak avoids it by
+     * coordinating the write on a node that is already in the key's preference list, so its read is
+     * local; this coordinator may not be in the preference list at all.
+     */
+    private CausalContext readCausalContext(String key, List<ClusterNode> replicas,
+                                            long deadlineNanos) {
+        ExecutorCompletionService<ReplicaResult> completion = new ExecutorCompletionService<>(executor);
+        List<Future<ReplicaResult>> futures = new ArrayList<>();
+        for (ClusterNode replica : replicas) {
+            futures.add(submitGet(completion, replica.getId(), key));
+        }
+
+        VersionMetadata merged = null;
+        int completed = 0;
+        int successes = 0;
+        try {
+            while (completed < replicas.size() && successes < config.getR()) {
+                ReplicaResult result = pollWithin(completion, deadlineNanos);
+                if (result == null) {
+                    break;
+                }
+                completed++;
+                if (!result.ok) {
+                    continue;
+                }
+                successes++;
+                for (VersionedValue observed : result.values) {
+                    merged = merged == null
+                        ? observed.getVersionMetadata()
+                        : merged.merge(observed.getVersionMetadata());
+                }
+            }
+        } finally {
+            cancelAll(futures);
+        }
+        return new CausalContext(successes >= config.getR(), successes, merged);
+    }
+
+    /** The merged causal context observed before a write, plus how many replicas answered. */
+    private static final class CausalContext {
+        final boolean quorumMet;
+        final int responded;
+        final VersionMetadata metadata; // null when the key is absent everywhere observed
+
+        CausalContext(boolean quorumMet, int responded, VersionMetadata metadata) {
+            this.quorumMet = quorumMet;
+            this.responded = responded;
+            this.metadata = metadata;
+        }
     }
 
     /** Submits a replica PUT task that catches its own failure and reports it as a {@link ReplicaResult}. */

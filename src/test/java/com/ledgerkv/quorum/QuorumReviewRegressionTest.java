@@ -343,6 +343,89 @@ class QuorumReviewRegressionTest {
         }
     }
 
+    /**
+     * The coordinator's per-key clock map started empty on construction, so a
+     * restarted coordinator reissued counter 1 while a surviving replica still held counter 2 — and
+     * the old value won the comparison against a write that had just been acknowledged.
+     */
+    @Test
+    void restartingCoordinatorMustNotReuseAnOlderClock() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            LeaderlessKVCluster before = f.quorum(2, 3);
+            assertTrue(before.write(0, "k", "v1").isSuccessful());
+            assertTrue(before.write(0, "k", "v2").isSuccessful());
+            before.close(); // the replica storage survives this coordinator restart
+
+            LeaderlessKVCluster restarted = f.quorum(2, 3);
+            f.nodes.get(2).writeAvailable = false;
+            QuorumResponse write = restarted.write(0, "k", "v3");
+            assertTrue(write.isSuccessful());
+            assertEquals(2, write.getRespondingNodes());
+
+            f.nodes.get(2).writeAvailable = true;
+            QuorumResponse read = restarted.read(0, "k");
+
+            assertTrue(read.isSuccessful());
+            assertEquals("v3", read.getValue().getValue(),
+                "the new acknowledged write reused clock 1 and lost to an old clock-2 replica");
+        }
+    }
+
+    /** Per-key counters still read 1, 2, 3 — deriving from stored state did not inflate them. */
+    @Test
+    void versionsRemainDenseAcrossACoordinatorRestart() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            LeaderlessKVCluster before = f.quorum(2, 3);
+            assertEquals(1, before.write(0, "k", "v1").getValue().getVersion());
+            assertEquals(2, before.write(0, "k", "v2").getValue().getVersion());
+            before.close();
+
+            LeaderlessKVCluster restarted = f.quorum(2, 3);
+
+            assertEquals(3, restarted.write(0, "k", "v3").getValue().getVersion());
+        }
+    }
+
+    /**
+     * Repair replaced the coordinator's clock entry with metadata it had read
+     * earlier, so a write that committed while repair was in flight had its counter reissued.
+     * There is no longer a map for repair to overwrite; the guard here is that the clock only ever
+     * advances.
+     */
+    @Test
+    void repairMustNotRewindAConcurrentWritersClock() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            LeaderlessKVCluster q = f.quorum(2, 3);
+            assertEquals(1, q.write(0, "k", "v1").getValue().getVersion());
+            assertEquals(2, q.write(0, "k", "v2").getValue().getVersion());
+
+            // Repair reads the current state and writes it back; it must not affect allocation.
+            assertTrue(q.repair(0, "k").isSuccessful());
+
+            assertEquals(3, q.write(0, "k", "v3").getValue().getVersion(),
+                "repair installed old read metadata over the clock of a later write");
+        }
+    }
+
+    /**
+     * A write cannot allocate a version it has not established is unused, so it refuses when it
+     * cannot reach a read quorum rather than reissuing a counter that a replica already holds.
+     */
+    @Test
+    void writeRefusesWhenTheCausalContextCannotBeRead() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            LeaderlessKVCluster q = f.quorum(1, 2);
+            f.nodes.get(1).readAvailable = false;
+            f.nodes.get(2).readAvailable = false;
+
+            QuorumResponse write = q.write(0, "k", "v1");
+
+            assertTrue(!write.isSuccessful(),
+                "without a read quorum the coordinator cannot know which counters are in use");
+            assertEquals(1, write.getRespondingNodes());
+        }
+    }
+
     private static VersionedValue single(List<VersionedValue> values) {
         assertEquals(1, values.size(), "expected exactly one value, got " + values);
         return values.get(0);
