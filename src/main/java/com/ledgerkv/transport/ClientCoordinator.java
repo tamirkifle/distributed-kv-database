@@ -25,4 +25,10 @@ public interface ClientCoordinator {
 
     /** Coordinates a quorum write and returns the stored value; throws if the write quorum is not met. */
     StoredValue put(String key, byte[] value);
+
+    /**
+     * Coordinates a quorum delete by replicating a tombstone, and reports whether a live value
+     * existed beforehand. Throws if the write quorum is not met.
+     */
+    boolean delete(String key);
 }

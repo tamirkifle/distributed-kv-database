@@ -426,6 +426,99 @@ class QuorumReviewRegressionTest {
         }
     }
 
+    /**
+     * With a quorum coordinator configured, Put and Get fanned out but Delete
+     * bypassed the coordinator and removed the value from one node's local engine — returning
+     * existed=true while a Get through the same client still read the value from another replica.
+     */
+    @Test
+    void publicDeleteMustNotAcknowledgeOnlyALocalDeletion() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, true)) {
+            LeaderlessKVCluster q = f.quorum(2, 2);
+            f.servers.get(0).useCoordinator(new QuorumClientCoordinator(q, 0));
+            NodeClient client = f.wireClients.get(0);
+            client.put("k", "v1".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+            assertTrue(client.delete("k"));
+
+            assertTrue(client.get("k").isEmpty(),
+                "Delete reported success but the same client still reads v1");
+        }
+    }
+
+    /** The tombstone reaches the other replicas, not just the coordinating node. */
+    @Test
+    void deleteReplicatesATombstoneToEveryReplica() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            LeaderlessKVCluster q = f.quorum(3, 3);
+            assertTrue(q.write(0, "k", "v1").isSuccessful());
+
+            assertTrue(q.delete(0, "k").isSuccessful());
+
+            for (ControlledReplica replica : f.nodes) {
+                VersionedValue held = single(replica.get("k"));
+                assertTrue(held.isDeleted(), replica.nodeId() + " must hold the tombstone");
+            }
+        }
+    }
+
+    /**
+     * The reason a delete has to carry a version: read repair must not resurrect the value from a
+     * replica that missed the delete.
+     */
+    @Test
+    void readRepairMustNotResurrectADeletedKey() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            LeaderlessKVCluster q = f.quorum(2, 3);
+            assertTrue(q.write(0, "k", "v1").isSuccessful());
+            f.nodes.get(2).writeAvailable = false;
+            assertTrue(q.delete(0, "k").isSuccessful());
+            f.nodes.get(2).writeAvailable = true;
+            // Replica 2 still holds the live v1 while the others hold the tombstone.
+            assertTrue(!single(f.nodes.get(2).get("k")).isDeleted());
+
+            assertTrue(q.repair(0, "k").isSuccessful());
+
+            assertTrue(single(f.nodes.get(2).get("k")).isDeleted(),
+                "repair copied the stale live value back over a newer delete");
+            assertTrue(q.read(0, "k").getValue().isDeleted());
+        }
+    }
+
+    /** Writing a key again after deleting it brings it back, with a clock above the tombstone. */
+    @Test
+    void aKeyCanBeRewrittenAfterDeletion() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            LeaderlessKVCluster q = f.quorum(2, 3);
+            assertTrue(q.write(0, "k", "v1").isSuccessful());
+            assertTrue(q.delete(0, "k").isSuccessful());
+
+            assertTrue(q.write(0, "k", "v2").isSuccessful());
+
+            QuorumResponse read = q.read(0, "k");
+            assertTrue(read.isSuccessful());
+            assertTrue(!read.getValue().isDeleted());
+            assertEquals("v2", read.getValue().getValue());
+        }
+    }
+
+    /** A delayed hint carrying a tombstone replays as a delete, not as an empty live value. */
+    @Test
+    void aHintedTombstoneReplaysAsADelete() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            LeaderlessKVCluster q = f.quorum(2, 3);
+            assertTrue(q.write(0, "k", "v1").isSuccessful());
+            f.nodes.get(2).writeAvailable = false;
+            assertTrue(q.delete(0, "k").isSuccessful());
+            assertEquals(1, q.getPendingHints().size());
+
+            f.nodes.get(2).writeAvailable = true;
+            assertEquals(1, q.replayPendingHints().getAppliedCount());
+
+            assertTrue(single(f.nodes.get(2).get("k")).isDeleted());
+        }
+    }
+
     private static VersionedValue single(List<VersionedValue> values) {
         assertEquals(1, values.size(), "expected exactly one value, got " + values);
         return values.get(0);

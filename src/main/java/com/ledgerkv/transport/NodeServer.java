@@ -152,7 +152,8 @@ public final class NodeServer implements AutoCloseable {
                 }
                 return;
             }
-            List<StoredValue> stored = store.get(request.getKey());
+            // A tombstone is a version internally but an absence to a client.
+            List<StoredValue> stored = live(store.get(request.getKey()));
             GetResponse.Builder resp = GetResponse.newBuilder();
             for (StoredValue value : stored) {
                 resp.addSiblings(VersionedValueProtos.toProto(value));
@@ -165,6 +166,17 @@ public final class NodeServer implements AutoCloseable {
             }
             responseObserver.onNext(resp.build());
             responseObserver.onCompleted();
+        }
+
+        /** Drops tombstones, which are storage-level records rather than client-visible values. */
+        private static List<StoredValue> live(List<StoredValue> values) {
+            List<StoredValue> result = new java.util.ArrayList<>();
+            for (StoredValue value : values) {
+                if (!value.tombstone()) {
+                    result.add(value);
+                }
+            }
+            return result;
         }
 
         @Override
@@ -196,6 +208,22 @@ public final class NodeServer implements AutoCloseable {
 
         @Override
         public void delete(DeleteRequest request, StreamObserver<DeleteResponse> responseObserver) {
+            ClientCoordinator coord = coordinator;
+            if (coord != null) {
+                // Replicate a tombstone across the key's replica set. Deleting only this node's
+                // local engine and reporting success left the value readable from every other
+                // replica.
+                try {
+                    boolean existed = coord.delete(request.getKey());
+                    responseObserver.onNext(
+                            DeleteResponse.newBuilder().setExisted(existed).build());
+                    responseObserver.onCompleted();
+                } catch (RuntimeException e) {
+                    responseObserver.onError(
+                            Status.UNAVAILABLE.withDescription(e.getMessage()).asRuntimeException());
+                }
+                return;
+            }
             boolean existed = engine.get(request.getKey()).isPresent();
             engine.delete(request.getKey());
             responseObserver.onNext(DeleteResponse.newBuilder().setExisted(existed).build());
@@ -215,7 +243,10 @@ public final class NodeServer implements AutoCloseable {
                     Entry entry = entries.next();
                     // A conflicted key streams its highest-versioned sibling; scan has no field to
                     // carry a conflict, and inventing one is out of scope for a range read.
-                    List<StoredValue> siblings = StoredValueCodec.decodeAll(entry.value());
+                    List<StoredValue> siblings = live(StoredValueCodec.decodeAll(entry.value()));
+                    if (siblings.isEmpty()) {
+                        continue; // every version of this key is a tombstone
+                    }
                     StoredValue value = siblings.stream()
                             .max(java.util.Comparator.comparingLong(StoredValue::version))
                             .orElseThrow(() -> new IllegalStateException("empty sibling set"));
@@ -273,7 +304,7 @@ public final class NodeServer implements AutoCloseable {
             store.merge(key, VersionedValueProtos.fromProto(value));
         }
 
-        /** The highest version currently stored for {@code key}, or 0 if absent. */
+        /** The highest version stored for {@code key} including tombstones, or 0 if absent. */
         private long currentVersion(String key) {
             return store.get(key).stream().mapToLong(StoredValue::version).max().orElse(0L);
         }

@@ -216,8 +216,31 @@ public final class LeaderlessKVCluster implements AutoCloseable {
     }
 
     public QuorumResponse write(int coordinatorIndex, String key, String value) {
-        validateCoordinator(coordinatorIndex);
         Objects.requireNonNull(value, "value must not be null");
+        return writeVersion(coordinatorIndex, key, value, false);
+    }
+
+    /**
+     * Replicates a <b>tombstone</b> for {@code key} through the ordinary quorum write path: a
+     * versioned marker meaning "deleted at this clock", which repairs and resolves conflicts like
+     * any other version (Cassandra and Riak both do this).
+     *
+     * <p>A delete has to be a write. Absence carries no version, so a replica that never held the
+     * key and one that deleted it look identical, and read repair cannot tell a deletion from a gap
+     * — it would copy the surviving value back over the delete. Deleting from one node's local
+     * engine and reporting success, as the public endpoint used to, leaves the value readable
+     * from every other replica.
+     *
+     * <p>Reclaiming tombstones (Cassandra's {@code gc_grace_seconds}) is not implemented: they are
+     * retained indefinitely, which is safe and unbounded.
+     */
+    public QuorumResponse delete(int coordinatorIndex, String key) {
+        return writeVersion(coordinatorIndex, key, "", true);
+    }
+
+    private QuorumResponse writeVersion(int coordinatorIndex, String key, String value,
+                                        boolean deleted) {
+        validateCoordinator(coordinatorIndex);
 
         long startNanos = System.nanoTime();
         long deadlineNanos = startNanos + requestDeadline.toNanos();
@@ -259,7 +282,8 @@ public final class LeaderlessKVCluster implements AutoCloseable {
                 ? VersionMetadata.initial(coordinatorNodeId)
                 : base.increment(coordinatorNodeId);
         });
-        VersionedValue versionedValue = new VersionedValue(value, versionFor(nextMetadata), nextMetadata);
+        VersionedValue versionedValue =
+            new VersionedValue(value, versionFor(nextMetadata), nextMetadata, deleted);
 
         List<ClusterNode> hedgeCandidates = hedgeCandidates(key, replicas.size());
         ExecutorCompletionService<ReplicaResult> completion = new ExecutorCompletionService<>(executor);
@@ -327,7 +351,7 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         boolean successful = acknowledgments >= config.getW();
         if (successful) {
             // The version was already stamped atomically above (compute); only record hints here.
-            recordHints(coordinatorIndex, key, value, nextMetadata, failedReplicaIds);
+            recordHints(coordinatorIndex, key, value, nextMetadata, deleted, failedReplicaIds);
         }
         VersionedValue responseValue = successful ? versionedValue : null;
         return new QuorumResponse(successful, responseValue, List.of(), acknowledgments,
@@ -352,8 +376,8 @@ public final class LeaderlessKVCluster implements AutoCloseable {
 
             try {
                 VersionMetadata hintMetadata = hint.getVersionMetadata();
-                client.deliverHint(hint.getKey(),
-                    new VersionedValue(hint.getValue(), versionFor(hintMetadata), hintMetadata));
+                client.deliverHint(hint.getKey(), new VersionedValue(
+                    hint.getValue(), versionFor(hintMetadata), hintMetadata, hint.isDeleted()));
                 appliedCount++;
             } catch (RuntimeException ignored) {
                 remainingHints.add(hint);
@@ -712,7 +736,8 @@ public final class LeaderlessKVCluster implements AutoCloseable {
     }
 
     private void recordHints(int coordinatorIndex, String key, String value,
-                             VersionMetadata versionMetadata, List<String> failedReplicaIds) {
+                             VersionMetadata versionMetadata, boolean deleted,
+                             List<String> failedReplicaIds) {
         if (failedReplicaIds.isEmpty()) {
             return;
         }
@@ -725,7 +750,8 @@ public final class LeaderlessKVCluster implements AutoCloseable {
                     failedReplicaId,
                     key,
                     value,
-                    versionMetadata
+                    versionMetadata,
+                    deleted
                 ));
             }
         }

@@ -44,6 +44,8 @@ public final class QuorumClientCoordinator implements ClientCoordinator {
         }
         List<StoredValue> values = new ArrayList<>();
         if (response.hasConflicts()) {
+            // A delete concurrent with a write is a genuine conflict, so tombstones stay in the
+            // sibling list here — the caller has to see that a delete is one of the candidates.
             // The key exists with concurrent values. Returning them is what lets the caller tell a
             // conflict from an absence; reporting the null winner as empty made a live key look
             // missing.
@@ -53,10 +55,25 @@ public final class QuorumClientCoordinator implements ClientCoordinator {
             return values;
         }
         VersionedValue value = response.getValue();
-        if (value != null) {
+        if (value != null && !value.isDeleted()) {
+            // A winning tombstone means the key is deleted: internally it is a version like any
+            // other, but to a client it is simply absent.
             values.add(toStored(value));
         }
         return values;
+    }
+
+    @Override
+    public boolean delete(String key) {
+        boolean existed = !get(key).isEmpty();
+        long hedgesBefore = cluster.hedgedRequestCount();
+        QuorumResponse response = cluster.delete(coordinatorIndex, key);
+        metricsCollector.recordWrite(response);
+        metricsCollector.recordHedges(cluster.hedgedRequestCount() - hedgesBefore);
+        if (!response.isSuccessful()) {
+            throw new IllegalStateException("write quorum not met for delete of key " + key);
+        }
+        return existed;
     }
 
     @Override
@@ -76,7 +93,7 @@ public final class QuorumClientCoordinator implements ClientCoordinator {
         return new StoredValue(
                 value.getValue().getBytes(StandardCharsets.UTF_8),
                 value.getVersion(),
-                false,
+                value.isDeleted(),
                 value.getVersionMetadata());
     }
 }
