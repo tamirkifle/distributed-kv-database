@@ -80,6 +80,10 @@ public final class LeaderlessKVCluster implements AutoCloseable {
     private final Duration requestDeadline;
     private final Duration hedgingDelay;
     private final AtomicLong hedgedRequestCount = new AtomicLong();
+    /** Writes released at W whose remaining replicas are still being accounted for. */
+    private final java.util.concurrent.atomic.AtomicInteger pendingReplications =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private final Object replicationIdle = new Object();
     private final boolean ownsExecutor;
 
     LeaderlessKVCluster(ClusterMembership membership, QuorumConfig config,
@@ -296,17 +300,24 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         int hedgesFired = 0;
         FailureContext.Builder failureContext = FailureContext.builder();
         List<String> acked = new ArrayList<>();
+        java.util.Set<String> primaryIds = new java.util.HashSet<>();
+        for (ClusterNode replica : replicas) {
+            primaryIds.add(replica.getId());
+        }
+        int primaryAcks = 0;
         int completed = 0;
         int submitted = replicas.size();
         long hedgeAtNanos = startNanos + hedgingDelay.toNanos();
         try {
-            // Collect completions until every submitted task reports (all-healthy) or W acks are in
-            // hand AND the deadline has elapsed. If the primaries have not produced W acks by the
-            // hedging delay, fire ONE backup request to the next distinct replica (request hedging):
-            // whichever of the slow primary or the hedge returns first counts. A slow/dead primary
-            // that never acks becomes a hinted handoff below.
+            // Return as soon as the quorum is satisfied. Continuing to wait after W acks were
+            // already durable held the client behind a slow minority for no benefit.
+            // Cassandra's write handler likewise signals the client
+            // at consistency-level-many acks and lets the remaining replicas finish behind it.
+            // If the primaries have not produced W acks by the hedging delay, fire ONE backup
+            // request to the next distinct replica (request hedging): whichever of the slow primary
+            // or the hedge returns first counts.
             while (completed < submitted) {
-                if (acknowledgments >= config.getW() && System.nanoTime() >= deadlineNanos) {
+                if (quorumMet(acknowledgments, primaryAcks)) {
                     break;
                 }
                 if (hedgesFired < MAX_HEDGES && acknowledgments < config.getW()
@@ -331,31 +342,132 @@ public final class LeaderlessKVCluster implements AutoCloseable {
                 if (result.ok && !acked.contains(result.nodeId)) {
                     acknowledgments++;
                     acked.add(result.nodeId);
+                    if (primaryIds.contains(result.nodeId)) {
+                        primaryAcks++;
+                    }
                     failureContext.responded(result.nodeId);
                 }
             }
-        } finally {
+        } catch (RuntimeException e) {
             cancelAll(futures);
+            throw e;
         }
 
-        // Any PRIMARY that did not positively ack within budget (failed OR too slow) becomes a hint.
-        // Hedge targets are not primaries: they contribute an ack if they win but are never hinted.
-        List<String> failedReplicaIds = new ArrayList<>();
+        boolean successful = quorumMet(acknowledgments, primaryAcks);
+        // Primaries that had not acknowledged at the instant the client was released. Reported as
+        // failed here because that is what the coordinator knows when it answers; the background
+        // task below keeps waiting and only files a hint for the ones that never arrive.
         for (ClusterNode replica : replicas) {
             if (!acked.contains(replica.getId())) {
-                failedReplicaIds.add(replica.getId());
                 failureContext.failed(replica.getId(), FailureCause.UNAVAILABLE_NODE);
             }
         }
 
-        boolean successful = acknowledgments >= config.getW();
         if (successful) {
-            // The version was already stamped atomically above (compute); only record hints here.
-            recordHints(coordinatorIndex, key, value, nextMetadata, deleted, failedReplicaIds);
+            finishReplicationInBackground(completion, futures, submitted - completed,
+                coordinatorIndex, key, value, nextMetadata, deleted, replicas,
+                new ArrayList<>(acked), deadlineNanos);
+        } else {
+            cancelAll(futures);
         }
         VersionedValue responseValue = successful ? versionedValue : null;
         return new QuorumResponse(successful, responseValue, List.of(), acknowledgments,
             config.getW(), elapsedMs(startNanos), failureContext.build());
+    }
+
+    /** Whether a write has met both the total and the primary-only acknowledgement thresholds. */
+    private boolean quorumMet(int acknowledgments, int primaryAcks) {
+        return acknowledgments >= config.getW() && primaryAcks >= config.getPw();
+    }
+
+    /**
+     * Whether a read has met both thresholds. {@code responders} counts distinct replicas that
+     * answered — not values, since one replica can return several siblings.
+     */
+    private boolean readQuorumMet(int responders, int primaryResponses) {
+        return responders >= config.getR() && primaryResponses >= config.getPr();
+    }
+
+    /**
+     * Keeps draining the replicas that had not answered when the client was released, and files a
+     * hinted handoff for each primary that never does.
+     *
+     * <p>Hint accounting has to outlive the client's call for the same reason Cassandra records
+     * hints from a late callback: at the moment it returns at W the coordinator does not yet know
+     * which of the remaining replicas will fail, and abandoning them there would lose the hint.
+     */
+    private void finishReplicationInBackground(
+            ExecutorCompletionService<ReplicaResult> completion,
+            List<Future<ReplicaResult>> futures, int outstanding, int coordinatorIndex, String key,
+            String value, VersionMetadata metadata, boolean deleted, List<ClusterNode> replicas,
+            List<String> ackedSoFar, long deadlineNanos) {
+        if (outstanding <= 0) {
+            cancelAll(futures);
+            recordMissingPrimaryHints(coordinatorIndex, key, value, metadata, deleted, replicas,
+                ackedSoFar);
+            return;
+        }
+        pendingReplications.incrementAndGet();
+        executor.execute(() -> {
+            try {
+                List<String> acked = new ArrayList<>(ackedSoFar);
+                for (int i = 0; i < outstanding; i++) {
+                    ReplicaResult result = pollWithin(completion, deadlineNanos);
+                    if (result == null) {
+                        break; // deadline reached; whoever is left becomes a hint
+                    }
+                    if (result.ok && !acked.contains(result.nodeId)) {
+                        acked.add(result.nodeId);
+                    }
+                }
+                cancelAll(futures);
+                recordMissingPrimaryHints(coordinatorIndex, key, value, metadata, deleted, replicas,
+                    acked);
+            } finally {
+                if (pendingReplications.decrementAndGet() == 0) {
+                    synchronized (replicationIdle) {
+                        replicationIdle.notifyAll();
+                    }
+                }
+            }
+        });
+    }
+
+    /**
+     * Files a hint for every PRIMARY that never acknowledged. Hedge targets are not primaries: they
+     * contribute an acknowledgement if they win, but are never hinted.
+     */
+    private void recordMissingPrimaryHints(int coordinatorIndex, String key, String value,
+            VersionMetadata metadata, boolean deleted, List<ClusterNode> replicas,
+            List<String> acked) {
+        List<String> failedReplicaIds = new ArrayList<>();
+        for (ClusterNode replica : replicas) {
+            if (!acked.contains(replica.getId())) {
+                failedReplicaIds.add(replica.getId());
+            }
+        }
+        recordHints(coordinatorIndex, key, value, metadata, deleted, failedReplicaIds);
+    }
+
+    /**
+     * Blocks until every write released early at W has finished accounting for its remaining
+     * replicas, so a caller (or a test) can observe hinted handoffs deterministically instead of
+     * racing the background task.
+     *
+     * @return true if replication went idle within the timeout
+     */
+    public boolean awaitReplication(Duration timeout) throws InterruptedException {
+        long deadlineNanos = System.nanoTime() + timeout.toNanos();
+        synchronized (replicationIdle) {
+            while (pendingReplications.get() > 0) {
+                long remaining = deadlineNanos - System.nanoTime();
+                if (remaining <= 0) {
+                    return false;
+                }
+                replicationIdle.wait(Math.max(1L, remaining / 1_000_000L));
+            }
+        }
+        return true;
     }
 
     public HintedHandoffReplayResult replayPendingHints() {
@@ -413,16 +525,23 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         List<VersionedValue> values = new ArrayList<>();
         FailureContext.Builder failureContext = FailureContext.builder();
         List<String> responded = new ArrayList<>();
+        java.util.Set<String> primaryIds = new java.util.HashSet<>();
+        for (ClusterNode replica : replicas) {
+            primaryIds.add(replica.getId());
+        }
+        int primaryResponses = 0;
         int completedCount = 0;
         int hedgesFired = 0;
         int submitted = replicas.size();
         long hedgeAtNanos = startNanos + hedgingDelay.toNanos();
         try {
-            // Block only until R reads (or the deadline). If R reads have not arrived by the hedging
-            // delay, fire ONE backup read to the next distinct replica (request hedging); a slow
-            // replica does not hold up the read.
-            while (completedCount < submitted && values.size() < config.getR()) {
-                if (hedgesFired < MAX_HEDGES && values.size() < config.getR()
+            // Block only until R replicas have RESPONDED (or the deadline). The threshold counts
+            // responders, not values: since replicas hold sibling sets, one replica returning two
+            // concurrent values would otherwise satisfy R=2 on its own.
+            // If R reads have not arrived by the hedging delay, fire ONE backup read to the next
+            // distinct replica (request hedging); a slow replica does not hold up the read.
+            while (completedCount < submitted && !readQuorumMet(responded.size(), primaryResponses)) {
+                if (hedgesFired < MAX_HEDGES && !readQuorumMet(responded.size(), primaryResponses)
                         && System.nanoTime() >= hedgeAtNanos && !hedgeCandidates.isEmpty()) {
                     futures.add(submitGet(completion, hedgeCandidates.get(hedgesFired).getId(), key));
                     hedgesFired++;
@@ -449,6 +568,9 @@ public final class LeaderlessKVCluster implements AutoCloseable {
                         values.addAll(result.values);
                     }
                     responded.add(result.nodeId);
+                    if (primaryIds.contains(result.nodeId)) {
+                        primaryResponses++;
+                    }
                     failureContext.responded(result.nodeId);
                 }
             }
@@ -464,7 +586,7 @@ public final class LeaderlessKVCluster implements AutoCloseable {
             }
         }
 
-        boolean successful = values.size() >= config.getR();
+        boolean successful = readQuorumMet(responded.size(), primaryResponses);
         VersionedValue latest = successful
             ? values.stream()
                 .filter(Objects::nonNull)
@@ -472,7 +594,7 @@ public final class LeaderlessKVCluster implements AutoCloseable {
                 .orElse(null)
             : null;
 
-        return new QuorumResponse(successful, latest, values, values.size(),
+        return new QuorumResponse(successful, latest, values, responded.size(),
             config.getR(), elapsedMs(startNanos), failureContext.build());
     }
 
@@ -691,10 +813,19 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         }
     }
 
+    /**
+     * Stops waiting on outstanding replica tasks without interrupting them.
+     *
+     * <p>{@code cancel(true)} would interrupt a thread that may be inside a {@link
+     * java.nio.channels.FileChannel} write, and interrupting a channel operation <em>closes the
+     * channel</em> — permanently breaking that replica's write-ahead log for every later write, not
+     * just this one. The coordinator only needs to stop waiting; a task that is already running is
+     * left to finish on its own, and a task that has not started is prevented from starting.
+     */
     private static void cancelAll(List<Future<ReplicaResult>> futures) {
         for (Future<ReplicaResult> future : futures) {
             if (!future.isDone()) {
-                future.cancel(true);
+                future.cancel(false);
             }
         }
     }
@@ -708,11 +839,22 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         return (System.nanoTime() - startNanos) / 1_000_000L;
     }
 
-    /** Shuts down the executor only if this cluster owns it (a caller-supplied pool is theirs). */
+    /**
+     * Waits for replication released early at W to finish accounting, then shuts down the executor
+     * if this cluster owns it (a caller-supplied pool is the caller's to shut down).
+     *
+     * <p>Draining first matters: tearing the pool down under a running replication task interrupts
+     * it mid-write, which closes the replica's channel rather than merely abandoning the write.
+     */
     @Override
     public void close() {
+        try {
+            awaitReplication(Duration.ofSeconds(5));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
         if (ownsExecutor) {
-            executor.shutdownNow();
+            executor.shutdown();
         }
     }
 

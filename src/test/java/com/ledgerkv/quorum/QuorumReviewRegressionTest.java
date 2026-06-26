@@ -114,6 +114,7 @@ class QuorumReviewRegressionTest {
         final List<ControlledReplica> nodes = new ArrayList<>();
         final Map<String, ReplicaClient> replicas = new LinkedHashMap<>();
         final ExecutorService fanout = Executors.newCachedThreadPool();
+        final List<LeaderlessKVCluster> clusters = new ArrayList<>();
 
         Fixture(Path base, int count, int replication, boolean grpc) throws Exception {
             membership = ClusterMembership.create("review", count, replication);
@@ -139,9 +140,11 @@ class QuorumReviewRegressionTest {
         }
 
         LeaderlessKVCluster quorum(int w, int r) {
-            return LeaderlessKVCluster.create(membership,
+            LeaderlessKVCluster cluster = LeaderlessKVCluster.create(membership,
                 new QuorumConfig(membership.getReplicationFactor(), w, r), replicas, fanout,
                 Duration.ofSeconds(5), Duration.ZERO);
+            clusters.add(cluster);
+            return cluster;
         }
 
         /** Two causally concurrent values, written by different authors, split across replicas. */
@@ -155,7 +158,12 @@ class QuorumReviewRegressionTest {
 
         @Override
         public void close() throws Exception {
-            fanout.shutdownNow();
+            // Drain replication released early at W before tearing anything down. shutdownNow()
+            // would interrupt a task inside a channel write, which closes that replica's WAL.
+            for (LeaderlessKVCluster cluster : clusters) {
+                cluster.awaitReplication(Duration.ofSeconds(5));
+            }
+            fanout.shutdown();
             fanout.awaitTermination(5, TimeUnit.SECONDS);
             for (NodeClient client : wireClients) {
                 client.close();
@@ -179,10 +187,13 @@ class QuorumReviewRegressionTest {
             LeaderlessKVCluster q = f.quorum(2, 3);
             f.nodes.get(2).writeAvailable = false;
             assertTrue(q.write(0, "k", "v1").isSuccessful());
+            // The write returns at W; the hint is filed by the background accounting task.
+            assertTrue(q.awaitReplication(Duration.ofSeconds(5)));
             assertEquals(1, q.getPendingHints().size());
 
             f.nodes.get(2).writeAvailable = true;
             assertTrue(q.write(0, "k", "v2").isSuccessful());
+            assertTrue(q.awaitReplication(Duration.ofSeconds(5)));
             assertEquals("v2", single(f.nodes.get(2).get("k")).getValue());
 
             assertEquals(1, q.replayPendingHints().getAppliedCount());
@@ -201,6 +212,7 @@ class QuorumReviewRegressionTest {
             assertTrue(q.write(0, "k", "v1").isSuccessful());
             f.nodes.get(2).writeAvailable = true;
             assertTrue(q.write(0, "k", "v2").isSuccessful());
+            assertTrue(q.awaitReplication(Duration.ofSeconds(5)));
 
             assertEquals(1, q.replayPendingHints().getAppliedCount());
 
@@ -517,6 +529,122 @@ class QuorumReviewRegressionTest {
 
             assertTrue(single(f.nodes.get(2).get("k")).isDeleted());
         }
+    }
+
+    /**
+     * The write loop kept collecting every submitted response, and reaching W only
+     * ended it once the request deadline had <em>also</em> elapsed. With N=3, W=2 and the third
+     * replica blocked, two replicas had durably stored the value while the client stayed blocked.
+     */
+    @Test
+    void quorumWriteMustNotWaitForABlockedMinorityAfterWAcks() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            LeaderlessKVCluster q = f.quorum(2, 2);
+            CountDownLatch twoStored = new CountDownLatch(2);
+            CountDownLatch release = new CountDownLatch(1);
+            List<ClusterNode> prefs = f.membership.getPreferenceList("k", 3);
+            replica(f, prefs.get(0)).wrote = twoStored;
+            replica(f, prefs.get(1)).wrote = twoStored;
+            replica(f, prefs.get(2)).holdPut = release;
+
+            ExecutorService driver = Executors.newSingleThreadExecutor();
+            java.util.concurrent.Future<QuorumResponse> write =
+                driver.submit(() -> q.write(0, "k", "v1"));
+            try {
+                assertTrue(twoStored.await(5, TimeUnit.SECONDS),
+                    "two durable writes must complete first");
+                QuorumResponse response = write.get(2, TimeUnit.SECONDS);
+
+                assertTrue(response.isSuccessful());
+                assertEquals(2, response.getRespondingNodes());
+                assertEquals(1, replica(f, prefs.get(2)).holdPut.getCount(),
+                    "the third replica is still blocked inside its put");
+            } finally {
+                release.countDown();
+                write.get(5, TimeUnit.SECONDS);
+                driver.shutdownNow();
+            }
+        }
+    }
+
+    /**
+     * A backup replica outside the primary N could count toward W, so a write set
+     * and a read set could be disjoint while both hit their thresholds — and the config still
+     * claimed strong consistency. PW/PR count only primaries, so the overlap can be demanded.
+     */
+    @Test
+    void overlapFlagMustNotPromiseFreshReadsWithHedgedReplicaSets() {
+        QuorumConfig sloppy = new QuorumConfig(3, 2, 2);
+
+        assertTrue(sloppy.hasQuorumOverlap(), "the numbers do satisfy W+R>N");
+        assertTrue(!sloppy.guaranteesReadYourWrites(),
+            "with no primary requirement a fallback ack can make the sets disjoint");
+
+        QuorumConfig strict = new QuorumConfig(3, 2, 2, 2, 2);
+        assertTrue(strict.guaranteesReadYourWrites(), "PW+PR>N is the condition that holds");
+    }
+
+    /** A write that cannot reach PW primaries fails, even when a hedge supplies the Wth ack. */
+    @Test
+    void writeFailsWhenPrimaryAcksFallBelowPw() throws Exception {
+        try (Fixture f = new Fixture(dir, 4, 3, false)) {
+            List<ClusterNode> prefs = f.membership.getPreferenceList("k", 4);
+            replica(f, prefs.get(1)).writeAvailable = false;
+            replica(f, prefs.get(2)).writeAvailable = false;
+            LeaderlessKVCluster q = LeaderlessKVCluster.create(f.membership,
+                new QuorumConfig(3, 2, 2, 2, 2), f.replicas, f.fanout,
+                Duration.ofMillis(300), Duration.ZERO);
+            f.clusters.add(q);
+
+            QuorumResponse write = q.write(0, "k", "v1");
+
+            assertTrue(!write.isSuccessful(),
+                "only one primary could ack, so PW=2 is not satisfied even if a hedge answers");
+        }
+    }
+
+    /** With every primary reachable, the same strict configuration succeeds. */
+    @Test
+    void writeSucceedsWhenPrimaryAcksMeetPw() throws Exception {
+        try (Fixture f = new Fixture(dir, 4, 3, false)) {
+            LeaderlessKVCluster q = LeaderlessKVCluster.create(f.membership,
+                new QuorumConfig(3, 2, 2, 2, 2), f.replicas, f.fanout,
+                Duration.ofSeconds(5), Duration.ZERO);
+            f.clusters.add(q);
+
+            QuorumResponse write = q.write(0, "k", "v1");
+
+            assertTrue(write.isSuccessful());
+            QuorumResponse read = q.read(0, "k");
+            assertTrue(read.isSuccessful());
+            assertEquals("v1", read.getValue().getValue());
+        }
+    }
+
+    /** A read counts responding replicas, not values: siblings must not inflate the quorum. */
+    @Test
+    void readQuorumCountsRespondersRatherThanSiblings() throws Exception {
+        try (Fixture f = new Fixture(dir, 3, 3, false)) {
+            // One replica holds two concurrent siblings; the other two are unreachable.
+            List<ClusterNode> prefs = f.membership.getPreferenceList("k", 3);
+            replica(f, prefs.get(0)).put("k",
+                new VersionedValue("branch-a", 1, VersionMetadata.initial("writer-a")));
+            replica(f, prefs.get(0)).put("k",
+                new VersionedValue("branch-b", 1, VersionMetadata.initial("writer-b")));
+            replica(f, prefs.get(1)).readAvailable = false;
+            replica(f, prefs.get(2)).readAvailable = false;
+            LeaderlessKVCluster q = f.quorum(2, 2);
+
+            QuorumResponse read = q.read(0, "k");
+
+            assertTrue(!read.isSuccessful(),
+                "two siblings from one replica are one response, not a read quorum of two");
+            assertEquals(1, read.getRespondingNodes());
+        }
+    }
+
+    private static ControlledReplica replica(Fixture f, ClusterNode node) {
+        return (ControlledReplica) f.replicas.get(node.getId());
     }
 
     private static VersionedValue single(List<VersionedValue> values) {

@@ -51,7 +51,8 @@ public final class NodeMain {
         ExecutorService quorumExecutor = Executors.newCachedThreadPool();
         LeaderlessKVCluster cluster = LeaderlessKVCluster.create(
                 membership,
-                new QuorumConfig(config.replicationFactor(), config.writeQuorum(), config.readQuorum()),
+                new QuorumConfig(config.replicationFactor(), config.writeQuorum(),
+                        config.readQuorum(), config.primaryWriteQuorum(), config.primaryReadQuorum()),
                 replicas,
                 quorumExecutor,
                 config.requestDeadline(),

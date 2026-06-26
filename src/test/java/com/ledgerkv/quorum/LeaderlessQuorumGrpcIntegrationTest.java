@@ -77,7 +77,8 @@ class LeaderlessQuorumGrpcIntegrationTest {
 
         QuorumResponse write = cluster.write(0, "k", "v");
         assertTrue(write.isSuccessful());
-        assertEquals(3, write.getRespondingNodes());
+        // Released at W=2; the third replica is written behind the client.
+        assertEquals(2, write.getRespondingNodes());
 
         QuorumResponse read = cluster.read(1, "k");
         assertTrue(read.isSuccessful());

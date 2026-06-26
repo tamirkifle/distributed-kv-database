@@ -19,17 +19,20 @@ class LeaderlessKVClusterTest {
     }
 
     @Test
-    void anyNodeCanCoordinateWritesToTheSameReplicaSet() {
+    void anyNodeCanCoordinateWritesToTheSameReplicaSet() throws Exception {
         LeaderlessKVCluster cluster = clusterFor(new QuorumConfig(3, 2, 2));
 
         QuorumResponse firstWrite = cluster.write(0, "trace:run-001", "baseline-score=0.82");
         QuorumResponse secondWrite = cluster.write(2, "trace:run-001", "baseline-score=0.91");
 
         assertTrue(firstWrite.isSuccessful());
-        assertEquals(3, firstWrite.getRespondingNodes());
+        // The client is released at W; the third replica is still being written behind it.
+        assertEquals(2, firstWrite.getRespondingNodes());
         assertEquals(2, firstWrite.getRequiredNodes());
         assertTrue(secondWrite.isSuccessful());
 
+        // Returning early does not mean abandoning the rest: every replica still converges.
+        assertTrue(cluster.awaitReplication(java.time.Duration.ofSeconds(5)));
         for (ClusterNode replica : cluster.selectReplicas("trace:run-001")) {
             VersionedValue storedValue = cluster.getReplicaValue(replica.getId(), "trace:run-001").orElseThrow();
             assertEquals("baseline-score=0.91", storedValue.getValue());

@@ -26,12 +26,15 @@ public final class NodeConfig {
     private final int replicationFactor;
     private final int writeQuorum;
     private final int readQuorum;
+    private final int primaryWriteQuorum;
+    private final int primaryReadQuorum;
     private final int requestDeadlineMillis;
     private final int hedgingDelayMillis;
     private final List<String> peers;
 
     private NodeConfig(String clusterId, int nodeIndex, int nodeCount, int grpcPort, int healthPort,
                        Path dataDir, int replicationFactor, int writeQuorum, int readQuorum,
+                       int primaryWriteQuorum, int primaryReadQuorum,
                        int requestDeadlineMillis, int hedgingDelayMillis, List<String> peers) {
         this.clusterId = clusterId;
         this.nodeIndex = nodeIndex;
@@ -42,6 +45,8 @@ public final class NodeConfig {
         this.replicationFactor = replicationFactor;
         this.writeQuorum = writeQuorum;
         this.readQuorum = readQuorum;
+        this.primaryWriteQuorum = primaryWriteQuorum;
+        this.primaryReadQuorum = primaryReadQuorum;
         this.requestDeadlineMillis = requestDeadlineMillis;
         this.hedgingDelayMillis = hedgingDelayMillis;
         this.peers = Collections.unmodifiableList(peers);
@@ -58,6 +63,10 @@ public final class NodeConfig {
         int replicationFactor = intOrDefault(env, "LEDGERKV_REPLICATION_FACTOR", 3);
         int writeQuorum = intOrDefault(env, "LEDGERKV_WRITE_QUORUM", 2);
         int readQuorum = intOrDefault(env, "LEDGERKV_READ_QUORUM", 2);
+        // Primary-only counts (Riak's pw/pr). Default 0 keeps the existing sloppy-quorum
+        // behaviour; set both so PW+PR>N to demand the overlap W+R>N only appears to give.
+        int primaryWriteQuorum = intOrDefault(env, "LEDGERKV_PRIMARY_WRITE_QUORUM", 0);
+        int primaryReadQuorum = intOrDefault(env, "LEDGERKV_PRIMARY_READ_QUORUM", 0);
         int requestDeadlineMillis = intOrDefault(env, "LEDGERKV_REQUEST_DEADLINE_MS", 5000);
         int hedgingDelayMillis = intOrDefault(env, "LEDGERKV_HEDGING_DELAY_MS", 50);
 
@@ -70,8 +79,8 @@ public final class NodeConfig {
                     "node index " + nodeIndex + " is out of range [0, " + nodeCount + ")");
         }
         return new NodeConfig(clusterId, nodeIndex, nodeCount, grpcPort, healthPort, dataDir,
-                replicationFactor, writeQuorum, readQuorum, requestDeadlineMillis, hedgingDelayMillis,
-                peers);
+                replicationFactor, writeQuorum, readQuorum, primaryWriteQuorum, primaryReadQuorum,
+                requestDeadlineMillis, hedgingDelayMillis, peers);
     }
 
     public String clusterId() { return clusterId; }
@@ -83,6 +92,8 @@ public final class NodeConfig {
     public int replicationFactor() { return replicationFactor; }
     public int writeQuorum() { return writeQuorum; }
     public int readQuorum() { return readQuorum; }
+    public int primaryWriteQuorum() { return primaryWriteQuorum; }
+    public int primaryReadQuorum() { return primaryReadQuorum; }
     public Duration requestDeadline() { return Duration.ofMillis(requestDeadlineMillis); }
     public Duration hedgingDelay() { return Duration.ofMillis(hedgingDelayMillis); }
     public List<String> peers() { return peers; }

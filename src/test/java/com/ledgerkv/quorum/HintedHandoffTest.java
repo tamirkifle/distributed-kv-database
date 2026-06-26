@@ -13,7 +13,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class HintedHandoffTest {
 
     @Test
-    void successfulPartialWriteRecordsHintForUnavailableReplica() {
+    void successfulPartialWriteRecordsHintForUnavailableReplica() throws Exception {
         ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
         Map<String, ReplicaClient> clients = InMemoryReplicaClient.clusterFor(membership);
         String unavailableNodeId = membership.getNodes().get(1).getId();
@@ -30,6 +30,9 @@ class HintedHandoffTest {
         QuorumResponse response = cluster.write(0, "trace:run-009", "score=0.91");
 
         assertTrue(response.isSuccessful());
+        // The write returns at W; the hint for the unavailable replica is filed by the background
+        // accounting task, so wait for that rather than racing it.
+        assertTrue(cluster.awaitReplication(java.time.Duration.ofSeconds(5)));
         List<HintedHandoff> pendingHints = cluster.getPendingHints();
         assertEquals(1, pendingHints.size());
         HintedHandoff hint = pendingHints.get(0);
@@ -41,7 +44,7 @@ class HintedHandoffTest {
     }
 
     @Test
-    void replayKeepsFailedHintsPendingAndClearsAppliedHints() {
+    void replayKeepsFailedHintsPendingAndClearsAppliedHints() throws Exception {
         ClusterMembership membership = ClusterMembership.create("test-cluster", 3, 3);
         Map<String, ReplicaClient> clients = InMemoryReplicaClient.clusterFor(membership);
         String unavailableNodeId = membership.getNodes().get(1).getId();
@@ -55,6 +58,7 @@ class HintedHandoffTest {
             clients
         );
         QuorumResponse writeResponse = cluster.write(0, "trace:run-010", "score=0.93");
+        assertTrue(cluster.awaitReplication(java.time.Duration.ofSeconds(5)));
 
         HintedHandoffReplayResult failedReplay = cluster.replayPendingHints();
         recovering.setAvailable(true);

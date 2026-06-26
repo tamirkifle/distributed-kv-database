@@ -36,11 +36,13 @@ class DeadlineBoundedFanoutTest {
             membership, new QuorumConfig(3, 2, 2), clients, pool, Duration.ofMillis(200));
 
         // W=2 fast replicas should satisfy the write without releasing the slow one. The write
-        // returns at the (small) deadline with two acks; the slow replica becomes a pending hint.
+        // returns as soon as those two acks are in hand; the slow replica becomes a pending hint
+        // once the background accounting task gives up on it at the deadline.
         QuorumResponse response = cluster.write(0, key, "v1");
 
         assertTrue(response.isSuccessful());
         assertEquals(2, response.getRespondingNodes());
+        assertTrue(cluster.awaitReplication(java.time.Duration.ofSeconds(5)));
         // The slow replica did not ack within budget -> becomes a pending hint.
         assertTrue(cluster.getPendingHints().stream()
             .anyMatch(h -> h.getTargetNodeId().equals(slowId)),
