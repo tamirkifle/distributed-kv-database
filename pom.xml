@@ -36,7 +36,7 @@
             <version>2.0.7</version>
         </dependency>
 
-        <!-- Transport: gRPC + protobuf (pre-locked stack, see CLAUDE.md) -->
+        <!-- Transport: gRPC + protobuf -->
         <dependency>
             <groupId>io.grpc</groupId>
             <artifactId>grpc-netty-shaded</artifactId>
