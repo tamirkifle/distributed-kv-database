@@ -36,6 +36,14 @@ public final class RaftNode {
     private long commitIndex = 0;
     private long lastApplied = 0;
 
+    /**
+     * Who this node believes leads the current term, or null when it does not know. Learned from
+     * whichever leader's AppendEntries/InstallSnapshot resets the election timer, and cleared on
+     * every step down because the next term's leader is not known yet. Volatile so a client-facing
+     * thread can read it for leader routing without taking this node's monitor.
+     */
+    private volatile String leaderId;
+
     // Election/heartbeat clock (logical).
     private int electionElapsed = 0;
     private int electionTimeout;
@@ -128,6 +136,11 @@ public final class RaftNode {
         return role;
     }
 
+    /** The leader of the current term as far as this node knows, or null. */
+    public String leaderId() {
+        return leaderId;
+    }
+
     public long currentTerm() {
         return currentTerm;
     }
@@ -169,6 +182,7 @@ public final class RaftNode {
         }
         // Recognize the leader for this term.
         role = RaftRole.FOLLOWER;
+        leaderId = req.leaderId();
         resetElectionTimer();
 
         if (!log.matches(req.prevLogIndex(), req.prevLogTerm())) {
@@ -205,6 +219,7 @@ public final class RaftNode {
             stepDown(req.term());
         }
         role = RaftRole.FOLLOWER;
+        leaderId = req.leaderId();
         resetElectionTimer();
 
         // commitIndex >= lastApplied always, so this one guard prevents both regressions. It also
@@ -249,6 +264,7 @@ public final class RaftNode {
         currentTerm = newTerm;
         role = RaftRole.FOLLOWER;
         votedFor = null;
+        leaderId = null;
         votesReceived.clear();
         persistTerm();
     }
@@ -330,6 +346,7 @@ public final class RaftNode {
         role = RaftRole.CANDIDATE;
         currentTerm++;
         votedFor = nodeId;
+        leaderId = null; // the term we are contesting has no leader we know of
         persistTerm();
         votesReceived.clear();
         votesReceived.add(nodeId);
@@ -363,6 +380,7 @@ public final class RaftNode {
 
     private void becomeLeader() {
         role = RaftRole.LEADER;
+        leaderId = nodeId;
         heartbeatElapsed = HEARTBEAT_INTERVAL; // send a heartbeat promptly
         nextIndex.clear();
         matchIndex.clear();
