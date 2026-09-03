@@ -342,7 +342,17 @@ public final class RaftNode {
         }
     }
 
-    private void startElection() {
+    /**
+     * The local half of starting an election: bump the term, vote for self, persist, and build the
+     * RequestVote to send. Returns null when there is nothing left to solicit — either a single-node
+     * group that won on its own vote, or a node that is no longer a candidate.
+     *
+     * <p>Split out from the fan-out so a caller can perform the vote RPCs with this node's monitor
+     * released. LogCabin does the same thing by handing its {@code lockGuard} into
+     * {@code requestVote()}; holding the lock across peer I/O blocks every inbound RPC for as long
+     * as the slowest unreachable peer takes to time out.
+     */
+    private RequestVoteRequest beginElection() {
         role = RaftRole.CANDIDATE;
         currentTerm++;
         votedFor = nodeId;
@@ -352,24 +362,72 @@ public final class RaftNode {
         votesReceived.add(nodeId);
         resetElectionTimer();
 
-        RequestVoteRequest req =
-                RequestVoteRequest.of(currentTerm, nodeId, log.lastIndex(), log.lastTerm());
+        if (hasMajority(votesReceived.size())) {
+            becomeLeader(); // single-node group: the self-vote is already a majority
+            return null;
+        }
+        return RequestVoteRequest.of(currentTerm, nodeId, log.lastIndex(), log.lastTerm());
+    }
+
+    /**
+     * Folds one peer's vote reply into the election started at {@code electionTerm}, promoting this
+     * node as soon as a majority has granted. Returns true while the election is still worth
+     * soliciting, false once this node has won, stepped down, or moved on to another term.
+     *
+     * <p>Safe to call from any thread, so the fan-out can run on the replication driver's threads.
+     */
+    public synchronized boolean recordVote(
+            String peerId, long electionTerm, RequestVoteResponse resp) {
+        if (resp.term() > currentTerm) {
+            stepDown(resp.term());
+            return false;
+        }
+        if (role != RaftRole.CANDIDATE || currentTerm != electionTerm) {
+            return false; // this election is already over
+        }
+        if (resp.term() != electionTerm) {
+            return true; // reply from an older term: ignore it, but keep soliciting the rest
+        }
+        if (resp.voteGranted()) {
+            votesReceived.add(peerId);
+            if (hasMajority(votesReceived.size())) {
+                becomeLeader();
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * The {@link #tick()} a {@link RaftReplicationDriver} calls instead: it advances the election
+     * clock and, when the timer fires, performs only the local half of starting an election. The
+     * returned RequestVote is the driver's to fan out off-monitor, feeding each reply back through
+     * {@link #recordVote}. Returns null when no election started.
+     */
+    public synchronized RequestVoteRequest tickForDriver() {
+        if (role == RaftRole.LEADER) {
+            return null; // the driver's peer threads own the leader's heartbeats
+        }
+        electionElapsed++;
+        if (electionElapsed < electionTimeout) {
+            return null;
+        }
+        return beginElection();
+    }
+
+    private void startElection() {
+        RequestVoteRequest req = beginElection();
+        if (req == null) {
+            return;
+        }
         for (RaftPeer peer : peers.values()) {
             try {
-                RequestVoteResponse resp = peer.requestVote(req);
-                if (resp.term() > currentTerm) {
-                    stepDown(resp.term());
-                    return;
-                }
-                if (resp.term() == currentTerm && resp.voteGranted()) {
-                    votesReceived.add(peer.nodeId());
+                if (!recordVote(peer.nodeId(), req.term(), peer.requestVote(req))) {
+                    return; // won, stepped down, or superseded: stop soliciting
                 }
             } catch (RuntimeException unreachable) {
                 // dropped RequestVote: no vote from this peer.
             }
-        }
-        if (role == RaftRole.CANDIDATE && hasMajority(votesReceived.size())) {
-            becomeLeader();
         }
     }
 
@@ -430,17 +488,48 @@ public final class RaftNode {
      * {@link #lastApplied()} to reach the returned index before reading the state machine.
      */
     public synchronized long readIndex() {
+        long index = readIndexCandidate();
+        if (index < 0) {
+            return -1;
+        }
+        if (!confirmLeadership()) {
+            return -1;
+        }
+        return index;
+    }
+
+    /**
+     * Steps 1-2 of the ReadIndex protocol (Ongaro §6.4): the commit index a linearizable read could
+     * be served at, or {@code -1} when this node must not answer. Performs no I/O, so a caller can
+     * run step 3 — the majority heartbeat round — with this node's monitor released. The index is
+     * only usable if that round succeeds and this node is still leader of the same term afterwards.
+     */
+    public synchronized long readIndexCandidate() {
         if (role != RaftRole.LEADER) {
             return -1;
         }
         if (log.termAt(commitIndex) != currentTerm) {
             return -1; // no current-term commit yet: the commit index is not yet trustworthy
         }
-        long index = commitIndex;
-        if (!confirmLeadership()) {
-            return -1;
+        return commitIndex;
+    }
+
+    /**
+     * An empty AppendEntries for {@code peerId}, i.e. the heartbeat ReadIndex step 3 counts
+     * acknowledgements of. Null when this node is not the leader.
+     *
+     * <p>It anchors on {@code matchIndex}, not {@code nextIndex}, and that choice is load-bearing:
+     * matchIndex is a prefix the follower has already confirmed, so the probe always passes the
+     * follower's log check. Building it from nextIndex the way {@link #nextReplicationRequest}
+     * does would ship a whole InstallSnapshot to a lagging follower merely to confirm leadership.
+     */
+    public synchronized AppendEntriesRequest heartbeatProbe(String peerId) {
+        if (role != RaftRole.LEADER) {
+            return null;
         }
-        return index;
+        long matched = Math.max(matchIndex.getOrDefault(peerId, 0L), log.lastIncludedIndex());
+        return AppendEntriesRequest.of(currentTerm, nodeId, matched, log.termAt(matched),
+                java.util.Collections.emptyList(), commitIndex);
     }
 
     /**
@@ -539,7 +628,7 @@ public final class RaftNode {
     }
 
     /** Injectable compaction trigger: compact once this many physical applied entries accumulate. */
-    void setCompactionThreshold(int threshold) {
+    public void setCompactionThreshold(int threshold) {
         this.compactionThreshold = threshold;
     }
 
