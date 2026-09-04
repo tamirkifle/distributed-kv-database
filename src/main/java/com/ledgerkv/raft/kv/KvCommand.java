@@ -62,6 +62,20 @@ public final class KvCommand {
         return value == null ? null : value.clone();
     }
 
+    /**
+     * A 64-bit FNV-1a digest of this command's encoding, used to tell a genuine retry apart from a
+     * different command reusing a sequence number. FNV-1a rather than {@code hashCode()} because
+     * 32 bits is too narrow for a check whose false match silently drops a write, and because the
+     * digest is compared across replicas and so must not depend on anything JVM-specific.
+     */
+    public long fingerprint() {
+        long hash = 0xcbf29ce484222325L;
+        for (byte b : encode()) {
+            hash = (hash ^ (b & 0xffL)) * 0x100000001b3L;
+        }
+        return hash;
+    }
+
     public byte[] encode() {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         try (DataOutputStream out = new DataOutputStream(baos)) {

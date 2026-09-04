@@ -48,7 +48,7 @@ class RaftKvStateMachineTest {
     void atMostOnceDoesNotReapplyDuplicate() {
         RaftKvStateMachine sm = new RaftKvStateMachine();
         sm.apply(KvCommand.put("c", 1, "k", "v1".getBytes()).encode());
-        sm.apply(KvCommand.put("other", 2, "k", "v2".getBytes()).encode());
+        sm.apply(KvCommand.put("other", 1, "k", "v2".getBytes()).encode());
         // re-deliver client c's seq 1 — must be ignored, not overwrite v2
         sm.apply(KvCommand.put("c", 1, "k", "v1".getBytes()).encode());
         assertArrayEquals("v2".getBytes(), sm.get("k"));
@@ -64,13 +64,77 @@ class RaftKvStateMachineTest {
     }
 
     @Test
-    void staleSequenceIsTreatedAsDuplicate() {
+    void staleSequenceIsRefused() {
         RaftKvStateMachine sm = new RaftKvStateMachine();
+        sm.apply(KvCommand.put("c", 1, "k", "v1".getBytes()).encode());
         sm.apply(KvCommand.put("c", 5, "k", "v5".getBytes()).encode());
-        // a lower sequence from the same client is stale -> ignored
+
         sm.apply(KvCommand.put("c", 4, "k", "v4".getBytes()).encode());
+
         assertArrayEquals("v5".getBytes(), sm.get("k"));
         assertEquals(5, sm.lastAppliedSequence("c"));
+        assertEquals(KvOutcome.Status.STALE_SEQUENCE,
+                sm.outcomeFor("c", 4, KvCommand.put("c", 4, "k", "v4".getBytes()).fingerprint())
+                        .status());
+    }
+
+    @Test
+    void reusingASequenceForADifferentCommandIsRefusedRatherThanDeduped() {
+        RaftKvStateMachine sm = new RaftKvStateMachine();
+        sm.apply(KvCommand.put("c", 1, "k", "first".getBytes()).encode());
+
+        KvCommand impostor = KvCommand.put("c", 1, "k", "second".getBytes());
+        sm.apply(impostor.encode());
+
+        assertArrayEquals("first".getBytes(), sm.get("k"), "the impostor must not take effect");
+        assertEquals(KvOutcome.Status.SEQUENCE_CONFLICT,
+                sm.outcomeFor("c", 1, impostor.fingerprint()).status(),
+                "absorbing this as a duplicate would drop a write with no trace");
+    }
+
+    @Test
+    void anUnseenClientMayOnlyOpenASessionAtSequenceOne() {
+        RaftKvStateMachine sm = new RaftKvStateMachine();
+        // No session and no way to tell a new client from one whose session was evicted, so a
+        // mid-stream sequence is refused rather than admitted as a fresh client.
+        sm.apply(KvCommand.put("ghost", 7, "k", "v".getBytes()).encode());
+        assertNull(sm.get("k"));
+        assertEquals(0, sm.lastAppliedSequence("ghost"));
+
+        sm.apply(KvCommand.put("ghost", 1, "k", "v".getBytes()).encode());
+        assertArrayEquals("v".getBytes(), sm.get("k"));
+    }
+
+    @Test
+    void sessionsAreCappedAndEvictedLeastRecentlyApplied() {
+        RaftKvStateMachine sm = new RaftKvStateMachine(2);
+        sm.apply(KvCommand.put("a", 1, "ka", "1".getBytes()).encode());
+        sm.apply(KvCommand.put("b", 1, "kb", "1".getBytes()).encode());
+        sm.apply(KvCommand.put("c", 1, "kc", "1".getBytes()).encode());
+
+        assertEquals(2, sm.sessionCount());
+        assertEquals(0, sm.lastAppliedSequence("a"), "the oldest session is the one dropped");
+        assertEquals(1, sm.lastAppliedSequence("b"));
+        assertEquals(1, sm.lastAppliedSequence("c"));
+        // Evicting the session must not touch the data it wrote.
+        assertArrayEquals("1".getBytes(), sm.get("ka"));
+    }
+
+    @Test
+    void readsDoNotDisturbEvictionOrder() {
+        // Reads run on the leader only. If they moved a session's recency, the leader would evict
+        // a different session than its followers and the replicas would diverge.
+        RaftKvStateMachine sm = new RaftKvStateMachine(2);
+        sm.apply(KvCommand.put("a", 1, "ka", "1".getBytes()).encode());
+        sm.apply(KvCommand.put("b", 1, "kb", "1".getBytes()).encode());
+
+        sm.get("ka");
+        sm.lastAppliedSequence("a");
+        sm.outcomeFor("a", 1, 0L);
+
+        sm.apply(KvCommand.put("c", 1, "kc", "1".getBytes()).encode());
+        assertEquals(0, sm.lastAppliedSequence("a"), "'a' is still the least recently applied");
+        assertEquals(1, sm.lastAppliedSequence("b"));
     }
 
     @Test
