@@ -39,6 +39,16 @@ message VersionedValuePb {
   VersionMetadataPb metadata = 4;
 }
 
+// Set on a response when the node that received the request is not the Raft leader, so the
+// request was not served. Mirrors TiKV's errorpb.NotLeader: a structured hint in the response
+// rather than a transport-level error, so a client can update its leader cache and retry without
+// parsing a status string. leader_endpoint is empty when this node does not know who leads.
+// Never set in quorum mode, where every node coordinates.
+message NotLeader {
+  string leader_id = 1;
+  string leader_endpoint = 2;
+}
+
 message GetRequest {
   string key = 1;
 }
@@ -51,23 +61,34 @@ message GetResponse {
   // Every value the read observed. One entry in the ordinary case; more than one means the caller
   // must resolve the conflict and write back, as Riak's HTTP 300 Multiple Choices does.
   repeated VersionedValuePb siblings = 3;
+  // Raft mode only: unset means this response is authoritative.
+  NotLeader not_leader = 4;
 }
 
 message PutRequest {
   string key = 1;
   bytes value = 2;
+  // Raft mode: the at-most-once identity of this mutation (Ongaro thesis 6.3). The pair must
+  // survive retries and leader changes unchanged, or a retry applies the write a second time.
+  // Required in Raft mode; ignored in quorum mode, which reconciles by vector clock instead.
+  string client_id = 3;
+  int64 sequence = 4;
 }
 
 message PutResponse {
   int64 version = 1;
+  NotLeader not_leader = 2;
 }
 
 message DeleteRequest {
   string key = 1;
+  string client_id = 2;
+  int64 sequence = 3;
 }
 
 message DeleteResponse {
   bool existed = 1;
+  NotLeader not_leader = 2;
 }
 
 message ScanRequest {
