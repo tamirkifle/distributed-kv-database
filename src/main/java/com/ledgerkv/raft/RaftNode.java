@@ -276,7 +276,7 @@ public final class RaftNode {
             if (command.length == 0) {
                 continue; // §8 no-op barrier: a log record only, never a state-machine command
             }
-            stateMachine.apply(command);
+            stateMachine.apply(command, lastApplied);
         }
         publishApplied();
     }

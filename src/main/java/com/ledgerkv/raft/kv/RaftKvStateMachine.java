@@ -47,11 +47,23 @@ public final class RaftKvStateMachine implements StateMachine {
 
     private static final byte[] EMPTY = new byte[0];
 
-    private final Map<String, byte[]> store = new java.util.HashMap<>();
+    /** A stored value and the log index of the command that wrote it, which is its version. */
+    private static final class Entry {
+        final byte[] value;
+        final long index;
+
+        Entry(byte[] value, long index) {
+            this.value = value;
+            this.index = index;
+        }
+    }
+
+    private final Map<String, Entry> store = new java.util.HashMap<>();
 
     private static final class Session {
         long lastSequence;
         long fingerprint;
+        long appliedIndex;
         byte[] lastResult;
     }
 
@@ -78,6 +90,11 @@ public final class RaftKvStateMachine implements StateMachine {
 
     @Override
     public synchronized byte[] apply(byte[] command) {
+        return apply(command, 0L);
+    }
+
+    @Override
+    public synchronized byte[] apply(byte[] command, long index) {
         KvCommand cmd = KvCommand.decode(command);
         Session session = sessions.get(cmd.clientId());
 
@@ -103,15 +120,16 @@ public final class RaftKvStateMachine implements StateMachine {
 
         byte[] result;
         if (cmd.op() == KvCommand.Op.PUT) {
-            store.put(cmd.key(), cmd.value());
+            store.put(cmd.key(), new Entry(cmd.value(), index));
             result = cmd.value();
         } else { // DELETE
-            byte[] previous = store.remove(cmd.key());
-            result = previous == null ? EMPTY : previous;
+            Entry previous = store.remove(cmd.key());
+            result = previous == null ? EMPTY : previous.value;
         }
 
         session.lastSequence = cmd.sequenceNumber();
         session.fingerprint = cmd.fingerprint();
+        session.appliedIndex = index;
         session.lastResult = result;
         touch(cmd.clientId(), session);
         evictOverflow();
@@ -148,13 +166,23 @@ public final class RaftKvStateMachine implements StateMachine {
         if (session.fingerprint != fingerprint) {
             return KvOutcome.of(KvOutcome.Status.SEQUENCE_CONFLICT);
         }
-        return KvOutcome.of(KvOutcome.Status.APPLIED, session.lastResult);
+        return KvOutcome.of(KvOutcome.Status.APPLIED, session.lastResult, session.appliedIndex);
     }
 
     /** Leader-side linearizable read off the applied state (null if absent). */
     public synchronized byte[] get(String key) {
-        byte[] v = store.get(key);
-        return v == null ? null : v.clone();
+        Entry e = store.get(key);
+        return e == null ? null : e.value.clone();
+    }
+
+    /**
+     * The log index of the command that last wrote {@code key}, or 0 if absent. This is the version
+     * a read reports: it identifies the write, so it only changes when the value does. The read's
+     * own ReadIndex would move on every read and tell a client nothing about the value it got.
+     */
+    public synchronized long versionOf(String key) {
+        Entry e = store.get(key);
+        return e == null ? 0L : e.index;
     }
 
     /** Last applied sequence number for a client (0 if the client has applied nothing). */
@@ -192,18 +220,20 @@ public final class RaftKvStateMachine implements StateMachine {
     public synchronized byte[] snapshot() {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         try (DataOutputStream out = new DataOutputStream(baos)) {
-            TreeMap<String, byte[]> sortedStore = new TreeMap<>(store);
+            TreeMap<String, Entry> sortedStore = new TreeMap<>(store);
             out.writeInt(sortedStore.size());
-            for (Map.Entry<String, byte[]> e : sortedStore.entrySet()) {
+            for (Map.Entry<String, Entry> e : sortedStore.entrySet()) {
                 writeString(out, e.getKey());
-                out.writeInt(e.getValue().length);
-                out.write(e.getValue());
+                out.writeLong(e.getValue().index);
+                out.writeInt(e.getValue().value.length);
+                out.write(e.getValue().value);
             }
             out.writeInt(sessions.size());
             for (Map.Entry<String, Session> e : sessions.entrySet()) {
                 writeString(out, e.getKey());
                 out.writeLong(e.getValue().lastSequence);
                 out.writeLong(e.getValue().fingerprint);
+                out.writeLong(e.getValue().appliedIndex);
                 byte[] r = e.getValue().lastResult;
                 if (r == null) {
                     out.writeInt(-1);
@@ -226,9 +256,10 @@ public final class RaftKvStateMachine implements StateMachine {
             int storeSize = in.readInt();
             for (int i = 0; i < storeSize; i++) {
                 String key = readString(in);
+                long index = in.readLong();
                 byte[] value = new byte[in.readInt()];
                 in.readFully(value);
-                store.put(key, value);
+                store.put(key, new Entry(value, index));
             }
             int sessionCount = in.readInt();
             for (int i = 0; i < sessionCount; i++) {
@@ -236,6 +267,7 @@ public final class RaftKvStateMachine implements StateMachine {
                 Session s = new Session();
                 s.lastSequence = in.readLong();
                 s.fingerprint = in.readLong();
+                s.appliedIndex = in.readLong();
                 int rlen = in.readInt();
                 if (rlen >= 0) {
                     byte[] r = new byte[rlen];

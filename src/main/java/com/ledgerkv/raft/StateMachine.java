@@ -12,6 +12,15 @@ public interface StateMachine {
     byte[] apply(byte[] command);
 
     /**
+     * Apply a committed command that sits at {@code index} in the log. State machines that expose
+     * a version to clients override this to record it; everyone else inherits the index-free form.
+     * {@link com.ledgerkv.raft.RaftNode} always calls this overload.
+     */
+    default byte[] apply(byte[] command, long index) {
+        return apply(command);
+    }
+
+    /**
      * Serialize the full applied state (including any at-most-once dedup state) to bytes for a
      * Raft snapshot. The default returns empty — suitable for trivial/test state machines that
      * never compact.

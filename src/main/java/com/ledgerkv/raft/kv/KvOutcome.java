@@ -31,18 +31,25 @@ public final class KvOutcome {
 
     private final Status status;
     private final byte[] value;
+    private final long appliedIndex;
 
-    private KvOutcome(Status status, byte[] value) {
+    private KvOutcome(Status status, byte[] value, long appliedIndex) {
         this.status = Objects.requireNonNull(status, "status");
         this.value = value;
+        this.appliedIndex = appliedIndex;
     }
 
-    static KvOutcome of(Status status, byte[] value) {
-        return new KvOutcome(status, value == null ? null : value.clone());
+    static KvOutcome of(Status status, byte[] value, long appliedIndex) {
+        return new KvOutcome(status, value == null ? null : value.clone(), appliedIndex);
     }
 
     static KvOutcome of(Status status) {
-        return new KvOutcome(status, null);
+        return new KvOutcome(status, null, 0L);
+    }
+
+    /** The log index the command applied at, which the public API reports as the version. */
+    public long appliedIndex() {
+        return appliedIndex;
     }
 
     public Status status() {
@@ -61,6 +68,7 @@ public final class KvOutcome {
 
     @Override
     public String toString() {
-        return "KvOutcome{" + status + " valueBytes=" + (value == null ? -1 : value.length) + '}';
+        return "KvOutcome{" + status + " index=" + appliedIndex
+                + " valueBytes=" + (value == null ? -1 : value.length) + '}';
     }
 }
