@@ -16,6 +16,16 @@ public final class PrometheusExporter {
 
     public static String render(String nodeId, OperationMetrics ops, LatencySummary latency,
                                 RepairMetrics repair) {
+        return render(nodeId, ops, latency, repair, null);
+    }
+
+    /**
+     * Renders the same families plus the Raft member gauges. {@code raft} is null in quorum mode,
+     * and the Raft families are then omitted entirely rather than exported as zeroes — a zero term
+     * on a node with no consensus is a reading, and it would be a false one.
+     */
+    public static String render(String nodeId, OperationMetrics ops, LatencySummary latency,
+                                RepairMetrics repair, RaftStatus raft) {
         Objects.requireNonNull(nodeId, "nodeId must not be null");
         Objects.requireNonNull(ops, "ops must not be null");
         Objects.requireNonNull(latency, "latency must not be null");
@@ -57,7 +67,37 @@ public final class PrometheusExporter {
         counter(sb, "ledgerkv_repair_latency_ms_total", "Cumulative repair latency (ms).", node,
             repair.getTotalRepairLatencyMs());
 
+        if (raft != null) {
+            sb.append("# HELP ledgerkv_raft_role This member's Raft role (1 for the role it holds)"
+                + ".\n");
+            sb.append("# TYPE ledgerkv_raft_role gauge\n");
+            for (String role : new String[] {"leader", "candidate", "follower"}) {
+                sb.append("ledgerkv_raft_role{node=\"").append(node)
+                    .append("\",role=\"").append(role).append("\"} ")
+                    .append(role.equalsIgnoreCase(raft.role()) ? 1 : 0).append('\n');
+            }
+            gauge(sb, "ledgerkv_raft_term", "Current Raft term.", node, raft.term());
+            gauge(sb, "ledgerkv_raft_commit_index", "Highest log index known committed.", node,
+                raft.commitIndex());
+            gauge(sb, "ledgerkv_raft_applied_index",
+                "Highest log index applied to the state machine.", node, raft.appliedIndex());
+            gauge(sb, "ledgerkv_raft_snapshot_index",
+                "Log base: entries at or below this live in a snapshot.", node,
+                raft.lastIncludedIndex());
+            sb.append("# HELP ledgerkv_raft_leader The leader this member recognizes.\n");
+            sb.append("# TYPE ledgerkv_raft_leader gauge\n");
+            sb.append("ledgerkv_raft_leader{node=\"").append(node)
+                .append("\",leader=\"").append(escapeLabelValue(raft.leaderId())).append("\"} ")
+                .append(raft.leaderId().isEmpty() ? 0 : 1).append('\n');
+        }
+
         return sb.toString();
+    }
+
+    private static void gauge(StringBuilder sb, String name, String help, String node, long value) {
+        sb.append("# HELP ").append(name).append(' ').append(help).append('\n');
+        sb.append("# TYPE ").append(name).append(" gauge\n");
+        sb.append(name).append("{node=\"").append(node).append("\"} ").append(value).append('\n');
     }
 
     private static void counter(StringBuilder sb, String name, String help, String node,

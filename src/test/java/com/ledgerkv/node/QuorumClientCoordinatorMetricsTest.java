@@ -10,6 +10,7 @@ import com.ledgerkv.quorum.InMemoryReplicaClient;
 import com.ledgerkv.quorum.LeaderlessKVCluster;
 import com.ledgerkv.quorum.ReplicaClient;
 import com.ledgerkv.metrics.OperationMetrics;
+import com.ledgerkv.transport.MutationId;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -33,7 +34,7 @@ class QuorumClientCoordinatorMetricsTest {
         QuorumClientCoordinator coordinator =
             new QuorumClientCoordinator(cluster(3, 3, 2, 2), 0);
 
-        coordinator.put("k", "v".getBytes(StandardCharsets.UTF_8));
+        coordinator.put("k", "v".getBytes(StandardCharsets.UTF_8), MutationId.absent());
         coordinator.get("k");
 
         OperationMetrics metrics = coordinator.operationMetrics();
@@ -56,7 +57,7 @@ class QuorumClientCoordinatorMetricsTest {
         QuorumClientCoordinator coordinator = new QuorumClientCoordinator(cluster, 0);
 
         assertThrows(IllegalStateException.class,
-            () -> coordinator.put("k", "v".getBytes(StandardCharsets.UTF_8)));
+            () -> coordinator.put("k", "v".getBytes(StandardCharsets.UTF_8), MutationId.absent()));
 
         OperationMetrics metrics = coordinator.operationMetrics();
         assertEquals(1, metrics.getWriteCount());
@@ -88,7 +89,7 @@ class QuorumClientCoordinatorMetricsTest {
             java.time.Duration.ofSeconds(2), java.time.Duration.ofMillis(20));
         QuorumClientCoordinator coordinator = new QuorumClientCoordinator(cluster, 0);
 
-        coordinator.put(key, "v".getBytes(StandardCharsets.UTF_8));
+        coordinator.put(key, "v".getBytes(StandardCharsets.UTF_8), MutationId.absent());
 
         assertEquals(1, coordinator.operationMetrics().getHedgedRequestCount());
         slow.release();

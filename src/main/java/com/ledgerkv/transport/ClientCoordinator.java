@@ -23,12 +23,26 @@ public interface ClientCoordinator {
      */
     List<StoredValue> get(String key);
 
-    /** Coordinates a quorum write and returns the stored value; throws if the write quorum is not met. */
-    StoredValue put(String key, byte[] value);
+    /**
+     * Coordinates a write and returns the stored value; throws if it could not be made durable.
+     * {@code id} carries the caller's at-most-once identity: the Raft path requires it and refuses
+     * a mutation without one, the quorum path ignores it.
+     */
+    StoredValue put(String key, byte[] value, MutationId id);
 
     /**
-     * Coordinates a quorum delete by replicating a tombstone, and reports whether a live value
-     * existed beforehand. Throws if the write quorum is not met.
+     * Coordinates a delete and reports whether a live value existed beforehand. Throws if it could
+     * not be made durable. {@code id} is used as in {@link #put}.
      */
-    boolean delete(String key);
+    boolean delete(String key, MutationId id);
+
+    /**
+     * Whether this coordinator can serve a range scan. The Raft path cannot: its state machine is
+     * an unordered map with no range iterator, and a scan served off one member's applied state
+     * would not be linearizable with the writes around it. {@code NodeServer} turns a false here
+     * into {@code UNIMPLEMENTED} rather than an empty stream, which would read as "no such range".
+     */
+    default boolean supportsScan() {
+        return true;
+    }
 }

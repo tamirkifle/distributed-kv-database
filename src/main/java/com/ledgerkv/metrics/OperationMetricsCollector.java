@@ -61,6 +61,29 @@ public final class OperationMetricsCollector {
     }
 
     /**
+     * Records an outcome for a coordinator that has no {@link QuorumResponse} to describe it — the
+     * Raft path, whose failures are leadership and commit-timeout failures rather than quorum
+     * shortfalls. Deliberately leaves {@code quorumFailureCount} alone so that counter keeps
+     * meaning what its name says on the one path that can produce it.
+     */
+    public void recordOperation(boolean read, boolean success, long latencyMs) {
+        synchronized (lock) {
+            operationCount++;
+            if (read) {
+                readCount++;
+            } else {
+                writeCount++;
+            }
+            if (success) {
+                successCount++;
+            } else {
+                failureCount++;
+            }
+            latencySamplesMs.add(Math.max(0L, latencyMs));
+        }
+    }
+
+    /**
      * Records that {@code delta} backup (hedge) requests fired during one operation. Clamps a negative
      * delta to zero — same defensive discipline as {@link #recordLatency}, so a caller that computes a
      * spurious negative (e.g. a counter that wrapped) can never make {@link OperationMetrics} throw.
