@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.ledgerkv.transport.LedgerKvClusterClient;
 import com.ledgerkv.transport.MutationId;
 import com.ledgerkv.transport.NodeClient;
 import com.ledgerkv.transport.NodeServer;
@@ -51,6 +52,7 @@ class RaftModeEndToEndTest {
         final List<NodeServer> servers = new ArrayList<>();
         final List<NodeClient> clients = new ArrayList<>();
         final Map<String, Integer> clientIndexById = new LinkedHashMap<>();
+        final List<String> endpoints = new ArrayList<>();
 
         Cluster(Path root, int size) throws IOException {
             this(root, allocate(size), allocate(size));
@@ -72,6 +74,7 @@ class RaftModeEndToEndTest {
                 peers.add("localhost:" + clientPorts.get(i));
                 raftPeers.add("localhost:" + raftPorts.get(i));
             }
+            endpoints.addAll(peers);
 
             for (int i = 0; i < size; i++) {
                 Map<String, String> env = new HashMap<>();
@@ -118,6 +121,24 @@ class RaftModeEndToEndTest {
             throw new AssertionError("no leader within " + SETTLE);
         }
 
+        String leaderEndpoint() throws InterruptedException {
+            awaitLeaderClient();
+            return endpoints.get(clientIndexById.get(runtimes.get(0).node().leaderId()));
+        }
+
+        /** Stops the current leader outright, the way a SIGKILL would. */
+        void stopLeader() throws Exception {
+            String leader = awaitSettledLeader();
+            int index = clientIndexById.get(leader);
+            servers.get(index).close();
+            runtimes.get(index).close();
+        }
+
+        String awaitSettledLeader() throws InterruptedException {
+            awaitLeaderClient();
+            return runtimes.get(0).node().leaderId();
+        }
+
         NodeClient anyFollowerClient() throws InterruptedException {
             awaitLeaderClient();
             String leader = runtimes.get(0).node().leaderId();
@@ -135,9 +156,11 @@ class RaftModeEndToEndTest {
                 try { c.close(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
             });
             servers.forEach(s -> {
-                try { s.close(); } catch (Exception e) { /* best effort */ }
+                try { s.close(); } catch (Exception e) { /* best effort, may already be stopped */ }
             });
-            runtimes.forEach(RaftRuntime::close);
+            runtimes.forEach(r -> {
+                try { r.close(); } catch (RuntimeException e) { /* already stopped */ }
+            });
         }
     }
 
@@ -235,6 +258,45 @@ class RaftModeEndToEndTest {
 
             assertEquals(Status.Code.UNIMPLEMENTED, e.getStatus().getCode(),
                     "an empty stream would read as 'no keys in range', which is a different claim");
+        }
+    }
+
+    @Test
+    void theClusterClientFindsTheLeaderFromAnyStartingPoint(@TempDir Path root) throws Exception {
+        try (Cluster cluster = new Cluster(root, 3)) {
+            cluster.awaitLeaderClient(); // let the group settle before pointing a client at it
+            try (LedgerKvClusterClient client = LedgerKvClusterClient.connect(
+                    cluster.endpoints, "app-1", Duration.ofSeconds(10))) {
+
+                assertTrue(client.put("k", "v".getBytes(UTF_8)) > 0);
+                assertArrayEquals("v".getBytes(UTF_8), client.get("k").orElseThrow(AssertionError::new));
+                assertTrue(client.delete("k"));
+                assertFalse(client.get("k").isPresent());
+
+                assertEquals(cluster.leaderEndpoint(), client.preferredEndpoint(),
+                        "the client should have settled on the leader, not kept sweeping");
+            }
+        }
+    }
+
+    @Test
+    void theClusterClientKeepsWritingAcrossALeaderLoss(@TempDir Path root) throws Exception {
+        try (Cluster cluster = new Cluster(root, 5)) {
+            cluster.awaitLeaderClient();
+            try (LedgerKvClusterClient client = LedgerKvClusterClient.connect(
+                    cluster.endpoints, "app-1", Duration.ofSeconds(20))) {
+
+                client.put("before", "1".getBytes(UTF_8));
+                cluster.stopLeader();
+
+                // The surviving majority elects a new leader; the client has to find it by itself.
+                client.put("after", "2".getBytes(UTF_8));
+
+                assertArrayEquals("1".getBytes(UTF_8),
+                        client.get("before").orElseThrow(AssertionError::new));
+                assertArrayEquals("2".getBytes(UTF_8),
+                        client.get("after").orElseThrow(AssertionError::new));
+            }
         }
     }
 
