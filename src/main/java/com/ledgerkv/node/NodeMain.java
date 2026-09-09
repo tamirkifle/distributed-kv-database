@@ -19,10 +19,17 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Container entrypoint. Reads {@link NodeConfig} from the environment, starts this node's gRPC
- * {@link NodeServer} + {@link HealthServer}, connects a {@link GrpcReplicaClient} to every peer
- * (including itself, over loopback), and routes the node's public Get/Put through a
- * {@link LeaderlessKVCluster} quorum coordinator. Blocks until the JVM is asked to shut down.
+ * Container entrypoint. Reads {@link NodeConfig} from the environment and starts whichever
+ * replication path {@code LEDGERKV_MODE} names, then blocks until the JVM is asked to shut down.
+ *
+ * <ul>
+ *   <li>{@code quorum} (the default) starts this node's {@link NodeServer} over its own
+ *       {@link com.ledgerkv.storage.lsm.LsmEngine}, connects a {@link GrpcReplicaClient} to every
+ *       peer including itself over loopback, and coordinates through {@link LeaderlessKVCluster}.
+ *   <li>{@code raft} starts a {@link RaftRuntime} on the separate Raft port and a storage-free
+ *       {@link NodeServer} in front of it. No LSM engine is opened: the Raft state machine is the
+ *       store.
+ * </ul>
  */
 public final class NodeMain {
 
@@ -31,6 +38,47 @@ public final class NodeMain {
 
     public static void main(String[] args) throws Exception {
         NodeConfig config = NodeConfig.fromEnv(System.getenv());
+        if (config.mode() == NodeMode.RAFT) {
+            startRaft(config);
+        } else {
+            startQuorum(config);
+        }
+    }
+
+    private static void startRaft(NodeConfig config) throws Exception {
+        RaftRuntime runtime = RaftRuntime.start(config);
+        NodeServer server = NodeServer.builder(config.grpcPort()).coordinatorOnly().build();
+        server.start();
+
+        RaftClientCoordinator coordinator = new RaftClientCoordinator(
+                runtime.node(), runtime.driver(), runtime.state(),
+                config.requestDeadline(), runtime.clientEndpoints());
+        server.useCoordinator(coordinator);
+
+        HealthServer health = HealthServer.start(config.healthPort(),
+                () -> PrometheusExporter.render(
+                        config.nodeId(),
+                        coordinator.operationMetrics(),
+                        LatencySummary.from(coordinator.operationMetrics()),
+                        RepairMetrics.empty(),
+                        runtime.status()),
+                runtime::ready);
+
+        System.out.println("LedgerKV " + config.nodeId() + " up: mode=raft"
+                + " gRPC=" + config.grpcPort() + " raft=" + config.raftPort()
+                + " health=" + config.healthPort()
+                + " deadline=" + config.requestDeadline().toMillis() + "ms"
+                + " peers=" + config.raftPeers());
+
+        awaitShutdown(() -> {
+            closeQuietly(server);
+            runtime.close();
+            health.close();
+        });
+    }
+
+    private static void startQuorum(NodeConfig config) throws Exception {
+        ClusterIdentity.claim(config.dataDir(), config.identity());
 
         NodeServer server = NodeServer.builder(config.grpcPort()).dataDir(config.dataDir()).build();
         server.start();
@@ -70,34 +118,41 @@ public final class NodeMain {
                         LatencySummary.from(coordinator.operationMetrics()),
                         RepairMetrics.empty()));
 
-        System.out.println("LedgerKV " + config.nodeId() + " up: gRPC=" + config.grpcPort()
+        System.out.println("LedgerKV " + config.nodeId() + " up: mode=quorum"
+                + " gRPC=" + config.grpcPort()
                 + " health=" + config.healthPort() + " deadline=" + config.requestDeadline().toMillis()
                 + "ms hedge=" + config.hedgingDelay().toMillis()
                 + "ms peers=" + config.peers());
 
-        CountDownLatch shutdown = new CountDownLatch(1);
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+        awaitShutdown(() -> {
             for (NodeClient client : peerClients) {
-                try {
-                    client.close();
-                } catch (Exception ignored) {
-                    // best-effort shutdown
-                }
+                closeQuietly(client);
             }
-            try {
-                server.close();
-            } catch (Exception ignored) {
-                // best-effort shutdown
-            }
-            try {
-                cluster.close();
-            } catch (Exception ignored) {
-                // best-effort shutdown
-            }
+            closeQuietly(server);
+            closeQuietly(cluster);
             quorumExecutor.shutdownNow();
             health.close();
+        });
+    }
+
+    private static void awaitShutdown(Runnable teardown) throws InterruptedException {
+        CountDownLatch shutdown = new CountDownLatch(1);
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                teardown.run();
+            } catch (RuntimeException ignored) {
+                // best-effort shutdown
+            }
             shutdown.countDown();
         }));
         shutdown.await();
+    }
+
+    private static void closeQuietly(AutoCloseable closeable) {
+        try {
+            closeable.close();
+        } catch (Exception ignored) {
+            // best-effort shutdown
+        }
     }
 }

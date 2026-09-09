@@ -28,7 +28,6 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -38,10 +37,16 @@ import java.util.concurrent.TimeUnit;
  * {@link VersionMetadata}) serialized through {@link StoredValueCodec}. The replica/quorum layer
  * that supplies real version metadata is wired in 2c; in 2b the node assigns a simple per-key
  * monotonic version derived from the current live value.
+ *
+ * <p>A server built with {@link Builder#coordinatorOnly()} has no engine at all. That is Raft mode:
+ * the state machine is the Raft group's own map, so opening an LSM engine would create a second,
+ * unused, still-fsyncing store on the same volume. Without an engine the local-storage paths —
+ * Scan and the replica RPCs — answer {@code UNIMPLEMENTED} rather than pretending to be empty.
  */
 public final class NodeServer implements AutoCloseable {
 
     private final Server server;
+    /** Null in Raft mode: the Raft state machine is the store, and a second one would be a bug. */
     private final LsmEngine engine;
     private final LedgerKvNodeService service;
 
@@ -83,12 +88,15 @@ public final class NodeServer implements AutoCloseable {
         if (!server.awaitTermination(5, TimeUnit.SECONDS)) {
             server.shutdownNow();
         }
-        engine.close();
+        if (engine != null) {
+            engine.close();
+        }
     }
 
     public static final class Builder {
         private final int port;
         private Path dataDir;
+        private boolean coordinatorOnly;
 
         private Builder(int port) {
             this.port = port;
@@ -100,7 +108,24 @@ public final class NodeServer implements AutoCloseable {
             return this;
         }
 
+        /**
+         * Builds a server with no local storage, whose public requests must all go through a
+         * {@link ClientCoordinator}. Used by Raft mode, where the replicated state machine already
+         * holds the data.
+         */
+        public Builder coordinatorOnly() {
+            this.coordinatorOnly = true;
+            return this;
+        }
+
         public NodeServer build() throws IOException {
+            if (coordinatorOnly) {
+                if (dataDir != null) {
+                    throw new IllegalStateException(
+                            "coordinatorOnly opens no engine, so dataDir would be ignored");
+                }
+                return new NodeServer(port, null);
+            }
             Objects.requireNonNull(dataDir, "dataDir must be set");
             return new NodeServer(port, LsmEngine.open(dataDir));
         }
@@ -118,7 +143,55 @@ public final class NodeServer implements AutoCloseable {
 
         LedgerKvNodeService(LsmEngine engine) {
             this.engine = engine;
-            this.store = new ReplicaStore(engine);
+            this.store = engine == null ? null : new ReplicaStore(engine);
+        }
+
+        /** The coordinator, or a failed RPC when this server has neither coordinator nor engine. */
+        private ClientCoordinator requireCoordinator(StreamObserver<?> observer) {
+            ClientCoordinator coord = coordinator;
+            if (coord == null && engine == null) {
+                observer.onError(Status.FAILED_PRECONDITION
+                        .withDescription("node has no storage and no coordinator attached yet")
+                        .asRuntimeException());
+            }
+            return coord;
+        }
+
+        /** Maps a coordinator failure onto a status, preserving a leader hint when there is one. */
+        private static void failClientRequest(StreamObserver<?> observer, RuntimeException e) {
+            if (e instanceof IllegalArgumentException) {
+                // A malformed request: a missing client id, or a sequence the client already used.
+                // Retrying it unchanged cannot help, so it must not look retriable.
+                observer.onError(Status.INVALID_ARGUMENT
+                        .withDescription(e.getMessage()).asRuntimeException());
+                return;
+            }
+            observer.onError(Status.UNAVAILABLE.withDescription(e.getMessage()).asRuntimeException());
+        }
+
+        /**
+         * The at-most-once identity on a request, or {@link MutationId#absent()} when the client
+         * sent none. Quorum mode ignores it; the Raft coordinator refuses a mutation without one.
+         */
+        private static MutationId mutationId(String clientId, long sequence) {
+            return clientId.isEmpty() ? MutationId.absent() : MutationId.of(clientId, sequence);
+        }
+
+        /** The NotLeader hint to attach to a response, or null when this node served the request. */
+        private static com.ledgerkv.transport.proto.NotLeader hintFrom(RuntimeException e) {
+            if (!(e instanceof NotLeaderException)) {
+                return null;
+            }
+            NotLeaderException notLeader = (NotLeaderException) e;
+            com.ledgerkv.transport.proto.NotLeader.Builder hint =
+                    com.ledgerkv.transport.proto.NotLeader.newBuilder();
+            if (notLeader.leaderId() != null) {
+                hint.setLeaderId(notLeader.leaderId());
+            }
+            if (notLeader.leaderEndpoint() != null) {
+                hint.setLeaderEndpoint(notLeader.leaderEndpoint());
+            }
+            return hint.build();
         }
 
         void setCoordinator(ClientCoordinator coordinator) {
@@ -127,7 +200,7 @@ public final class NodeServer implements AutoCloseable {
 
         @Override
         public void get(GetRequest request, StreamObserver<GetResponse> responseObserver) {
-            ClientCoordinator coord = coordinator;
+            ClientCoordinator coord = requireCoordinator(responseObserver);
             if (coord != null) {
                 try {
                     List<StoredValue> values = coord.get(request.getKey());
@@ -147,10 +220,18 @@ public final class NodeServer implements AutoCloseable {
                     responseObserver.onNext(resp.build());
                     responseObserver.onCompleted();
                 } catch (RuntimeException e) {
-                    responseObserver.onError(
-                            Status.UNAVAILABLE.withDescription(e.getMessage()).asRuntimeException());
+                    com.ledgerkv.transport.proto.NotLeader hint = hintFrom(e);
+                    if (hint != null) {
+                        responseObserver.onNext(GetResponse.newBuilder().setNotLeader(hint).build());
+                        responseObserver.onCompleted();
+                        return;
+                    }
+                    failClientRequest(responseObserver, e);
                 }
                 return;
+            }
+            if (engine == null) {
+                return; // requireCoordinator already failed the call
             }
             // A tombstone is a version internally but an absence to a client.
             List<StoredValue> stored = live(store.get(request.getKey()));
@@ -181,17 +262,27 @@ public final class NodeServer implements AutoCloseable {
 
         @Override
         public void put(PutRequest request, StreamObserver<PutResponse> responseObserver) {
-            ClientCoordinator coord = coordinator;
+            ClientCoordinator coord = requireCoordinator(responseObserver);
             if (coord != null) {
                 try {
-                    StoredValue stored = coord.put(request.getKey(), request.getValue().toByteArray());
+                    StoredValue stored = coord.put(request.getKey(),
+                            request.getValue().toByteArray(),
+                            mutationId(request.getClientId(), request.getSequence()));
                     responseObserver.onNext(
                             PutResponse.newBuilder().setVersion(stored.version()).build());
                     responseObserver.onCompleted();
                 } catch (RuntimeException e) {
-                    responseObserver.onError(
-                            Status.UNAVAILABLE.withDescription(e.getMessage()).asRuntimeException());
+                    com.ledgerkv.transport.proto.NotLeader hint = hintFrom(e);
+                    if (hint != null) {
+                        responseObserver.onNext(PutResponse.newBuilder().setNotLeader(hint).build());
+                        responseObserver.onCompleted();
+                        return;
+                    }
+                    failClientRequest(responseObserver, e);
                 }
+                return;
+            }
+            if (engine == null) {
                 return;
             }
             long nextVersion = currentVersion(request.getKey()) + 1;
@@ -208,20 +299,30 @@ public final class NodeServer implements AutoCloseable {
 
         @Override
         public void delete(DeleteRequest request, StreamObserver<DeleteResponse> responseObserver) {
-            ClientCoordinator coord = coordinator;
+            ClientCoordinator coord = requireCoordinator(responseObserver);
             if (coord != null) {
                 // Replicate a tombstone across the key's replica set. Deleting only this node's
                 // local engine and reporting success left the value readable from every other
                 // replica.
                 try {
-                    boolean existed = coord.delete(request.getKey());
+                    boolean existed = coord.delete(request.getKey(),
+                            mutationId(request.getClientId(), request.getSequence()));
                     responseObserver.onNext(
                             DeleteResponse.newBuilder().setExisted(existed).build());
                     responseObserver.onCompleted();
                 } catch (RuntimeException e) {
-                    responseObserver.onError(
-                            Status.UNAVAILABLE.withDescription(e.getMessage()).asRuntimeException());
+                    com.ledgerkv.transport.proto.NotLeader hint = hintFrom(e);
+                    if (hint != null) {
+                        responseObserver.onNext(
+                                DeleteResponse.newBuilder().setNotLeader(hint).build());
+                        responseObserver.onCompleted();
+                        return;
+                    }
+                    failClientRequest(responseObserver, e);
                 }
+                return;
+            }
+            if (engine == null) {
                 return;
             }
             boolean existed = engine.get(request.getKey()).isPresent();
@@ -232,6 +333,13 @@ public final class NodeServer implements AutoCloseable {
 
         @Override
         public void scan(ScanRequest request, StreamObserver<ScanEntry> responseObserver) {
+            ClientCoordinator coord = coordinator;
+            if (engine == null || (coord != null && !coord.supportsScan())) {
+                responseObserver.onError(Status.UNIMPLEMENTED
+                        .withDescription("scan is not available in this mode")
+                        .asRuntimeException());
+                return;
+            }
             int limit = request.getLimit();
             int emitted = 0;
             try (CloseableIterator<Entry> entries =
@@ -263,6 +371,12 @@ public final class NodeServer implements AutoCloseable {
         @Override
         public void replicaGet(ReplicaGetRequest request,
                 StreamObserver<ReplicaGetResponse> responseObserver) {
+            if (engine == null) {
+                responseObserver.onError(Status.UNIMPLEMENTED
+                        .withDescription("this node has no local replica store")
+                        .asRuntimeException());
+                return;
+            }
             List<StoredValue> stored = store.get(request.getKey());
             ReplicaGetResponse.Builder resp = ReplicaGetResponse.newBuilder();
             for (StoredValue value : stored) {
@@ -281,6 +395,12 @@ public final class NodeServer implements AutoCloseable {
         @Override
         public void replicaPut(ReplicaPutRequest request,
                 StreamObserver<ReplicaPutResponse> responseObserver) {
+            if (engine == null) {
+                responseObserver.onError(Status.UNIMPLEMENTED
+                        .withDescription("this node has no local replica store")
+                        .asRuntimeException());
+                return;
+            }
             storeVerbatim(request.getKey(), request.getValue());
             responseObserver.onNext(ReplicaPutResponse.newBuilder().setOk(true).build());
             responseObserver.onCompleted();
@@ -288,6 +408,12 @@ public final class NodeServer implements AutoCloseable {
 
         @Override
         public void deliverHint(HintRequest request, StreamObserver<HintResponse> responseObserver) {
+            if (engine == null) {
+                responseObserver.onError(Status.UNIMPLEMENTED
+                        .withDescription("this node has no local replica store")
+                        .asRuntimeException());
+                return;
+            }
             // The hint's target_node is this server; store the carried value verbatim.
             storeVerbatim(request.getKey(), request.getValue());
             responseObserver.onNext(HintResponse.newBuilder().setAccepted(true).build());

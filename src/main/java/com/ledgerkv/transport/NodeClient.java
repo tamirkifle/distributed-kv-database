@@ -2,6 +2,7 @@ package com.ledgerkv.transport;
 
 import com.google.protobuf.ByteString;
 import com.ledgerkv.transport.proto.DeleteRequest;
+import com.ledgerkv.transport.proto.DeleteResponse;
 import com.ledgerkv.transport.proto.GetRequest;
 import com.ledgerkv.transport.proto.GetResponse;
 import com.ledgerkv.transport.proto.HintRequest;
@@ -70,6 +71,7 @@ public final class NodeClient implements AutoCloseable {
      */
     public List<StoredValue> getSiblings(String key) {
         GetResponse response = stub.get(GetRequest.newBuilder().setKey(key).build());
+        throwIfRedirected(response.hasNotLeader() ? response.getNotLeader() : null);
         List<StoredValue> siblings = new ArrayList<>();
         for (VersionedValuePb sibling : response.getSiblingsList()) {
             siblings.add(VersionedValueProtos.fromProto(sibling));
@@ -79,16 +81,56 @@ public final class NodeClient implements AutoCloseable {
 
     /** Writes {@code value} under {@code key}; returns the assigned version. */
     public long put(String key, byte[] value) {
-        PutResponse response = stub.put(PutRequest.newBuilder()
+        return put(key, value, MutationId.absent());
+    }
+
+    /**
+     * Writes {@code value} under {@code key} carrying {@code id}, and returns the assigned version.
+     * Raft mode requires an id and rejects the write without one; quorum mode ignores it.
+     *
+     * @throws NotLeaderException if this node is not the Raft leader, carrying the leader's
+     *     endpoint when it knows one. Retry there, reusing the same {@code id}.
+     */
+    public long put(String key, byte[] value, MutationId id) {
+        PutRequest.Builder request = PutRequest.newBuilder()
                 .setKey(key)
-                .setValue(ByteString.copyFrom(value))
-                .build());
+                .setValue(ByteString.copyFrom(value));
+        if (id.isPresent()) {
+            request.setClientId(id.clientId()).setSequence(id.sequence());
+        }
+        PutResponse response = stub.put(request.build());
+        throwIfRedirected(response.hasNotLeader() ? response.getNotLeader() : null);
         return response.getVersion();
     }
 
     /** Deletes {@code key}; returns true if it existed. */
     public boolean delete(String key) {
-        return stub.delete(DeleteRequest.newBuilder().setKey(key).build()).getExisted();
+        return delete(key, MutationId.absent());
+    }
+
+    /** Deletes {@code key} carrying {@code id}; returns true if a live value existed. */
+    public boolean delete(String key, MutationId id) {
+        DeleteRequest.Builder request = DeleteRequest.newBuilder().setKey(key);
+        if (id.isPresent()) {
+            request.setClientId(id.clientId()).setSequence(id.sequence());
+        }
+        DeleteResponse response = stub.delete(request.build());
+        throwIfRedirected(response.hasNotLeader() ? response.getNotLeader() : null);
+        return response.getExisted();
+    }
+
+    /**
+     * Turns a {@code NotLeader} hint into a {@link NotLeaderException}. The hint travels as a field
+     * on an otherwise-successful response, TiKV-style, so without this a caller would read a
+     * redirect as a real answer: version 0, or a key that looks absent.
+     */
+    private static void throwIfRedirected(com.ledgerkv.transport.proto.NotLeader hint) {
+        if (hint == null) {
+            return;
+        }
+        String leaderId = hint.getLeaderId().isEmpty() ? null : hint.getLeaderId();
+        String endpoint = hint.getLeaderEndpoint().isEmpty() ? null : hint.getLeaderEndpoint();
+        throw new NotLeaderException(leaderId, endpoint);
     }
 
     /** Scans {@code [start, end)} in ascending key order, up to {@code limit} entries. */

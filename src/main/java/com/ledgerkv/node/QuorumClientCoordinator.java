@@ -6,6 +6,7 @@ import com.ledgerkv.quorum.LeaderlessKVCluster;
 import com.ledgerkv.metrics.OperationMetrics;
 import com.ledgerkv.metrics.OperationMetricsCollector;
 import com.ledgerkv.transport.ClientCoordinator;
+import com.ledgerkv.transport.MutationId;
 import com.ledgerkv.transport.StoredValue;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -16,6 +17,10 @@ import java.util.Objects;
  * Adapts a {@link LeaderlessKVCluster} (the leaderless quorum coordinator) to the transport-layer
  * {@link ClientCoordinator} seam. The cluster's value currency is UTF-8 {@code String} (a 2c
  * deferral), so request/response bytes are bridged through {@link StandardCharsets#UTF_8}.
+ *
+ * <p>The {@link MutationId} on a write is ignored here. Leaderless quorums have no single point to
+ * deduplicate against, so at-most-once is not on offer: concurrent writes reconcile by vector
+ * clock and surface as siblings instead.
  */
 public final class QuorumClientCoordinator implements ClientCoordinator {
 
@@ -64,7 +69,7 @@ public final class QuorumClientCoordinator implements ClientCoordinator {
     }
 
     @Override
-    public boolean delete(String key) {
+    public boolean delete(String key, MutationId id) {
         boolean existed = !get(key).isEmpty();
         long hedgesBefore = cluster.hedgedRequestCount();
         QuorumResponse response = cluster.delete(coordinatorIndex, key);
@@ -77,7 +82,7 @@ public final class QuorumClientCoordinator implements ClientCoordinator {
     }
 
     @Override
-    public StoredValue put(String key, byte[] value) {
+    public StoredValue put(String key, byte[] value, MutationId id) {
         long hedgesBefore = cluster.hedgedRequestCount();
         String asString = new String(value, StandardCharsets.UTF_8);
         QuorumResponse response = cluster.write(coordinatorIndex, key, asString);
