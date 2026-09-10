@@ -1,0 +1,109 @@
+# StatefulSet: a 5-member LedgerKV Raft group with stable ordinal identity
+# (ledgerkv-raft-0..ledgerkv-raft-4), each with its own PersistentVolume for the Raft log and
+# snapshots under /data.
+#
+# Identity: StatefulSet env is identical across pods, so LEDGERKV_NODE_INDEX is derived at runtime
+# from the pod's ordinal (ledgerkv-raft-3 -> "3"). That ordinal maps the pod to its member id and
+# to its slot in the positional LEDGERKV_PEERS / LEDGERKV_RAFT_PEERS lists, so every member agrees
+# on who is who. A stable identity is load-bearing for Raft in a way it is not for quorum mode: a
+# member's vote and log belong to its id, so a pod that came back as a different ordinal on the
+# same volume would be a second member claiming one log. The cluster-identity marker written into
+# /data refuses that at startup.
+#
+# Sizing: 3 or 5 members. NodeConfig rejects anything else, because an even group tolerates no
+# more failures than the odd one below it while needing one more vote to commit.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ledgerkv-raft
+  labels:
+    app: ledgerkv-raft
+spec:
+  serviceName: ledgerkv-raft-headless
+  replicas: 5
+  podManagementPolicy: Parallel  # members must dial each other to elect; start them together
+  selector:
+    matchLabels:
+      app: ledgerkv-raft
+  template:
+    metadata:
+      labels:
+        app: ledgerkv-raft
+    spec:
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: ledgerkv
+          image: ledgerkv:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export LEDGERKV_NODE_INDEX="${HOSTNAME##*-}"
+              echo "deriving ordinal from $HOSTNAME -> index $LEDGERKV_NODE_INDEX"
+              exec java -jar /app/ledgerkv.jar
+          ports:
+            - name: grpc
+              containerPort: 9090
+            - name: raft
+              containerPort: 9095
+            - name: health
+              containerPort: 8080
+          env:
+            - name: LEDGERKV_MODE
+              value: "raft"
+            - name: LEDGERKV_CLUSTER_ID
+              value: "ledgerkv"
+            - name: LEDGERKV_NODE_COUNT
+              value: "5"
+            - name: LEDGERKV_GRPC_PORT
+              value: "9090"
+            - name: LEDGERKV_RAFT_PORT
+              value: "9095"
+            - name: LEDGERKV_HEALTH_PORT
+              value: "8080"
+            - name: LEDGERKV_DATA_DIR
+              value: "/data"
+            - name: LEDGERKV_PEERS
+              value: "ledgerkv-raft-0.ledgerkv-raft-headless:9090,ledgerkv-raft-1.ledgerkv-raft-headless:9090,ledgerkv-raft-2.ledgerkv-raft-headless:9090,ledgerkv-raft-3.ledgerkv-raft-headless:9090,ledgerkv-raft-4.ledgerkv-raft-headless:9090"
+            - name: LEDGERKV_RAFT_PEERS
+              value: "ledgerkv-raft-0.ledgerkv-raft-headless:9095,ledgerkv-raft-1.ledgerkv-raft-headless:9095,ledgerkv-raft-2.ledgerkv-raft-headless:9095,ledgerkv-raft-3.ledgerkv-raft-headless:9095,ledgerkv-raft-4.ledgerkv-raft-headless:9095"
+            - name: LEDGERKV_RAFT_HEARTBEAT_MS
+              value: "100"
+            - name: LEDGERKV_RAFT_ELECTION_MIN_TICKS
+              value: "10"
+            - name: LEDGERKV_RAFT_ELECTION_MAX_TICKS
+              value: "20"
+            - name: LEDGERKV_RAFT_RPC_DEADLINE_MS
+              value: "500"
+            - name: LEDGERKV_RAFT_SNAPSHOT_THRESHOLD
+              value: "10000"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          # Readiness gates membership of the client Service: a pod that knows no leader is pulled
+          # out until the election settles.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          # Liveness is deliberately /livez and not /readyz. Restarting a healthy follower because
+          # its leader disappeared would remove a vote from the majority that has to elect the
+          # next one, turning one failure into an outage.
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

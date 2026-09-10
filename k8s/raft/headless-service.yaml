@@ -1,0 +1,29 @@
+# Headless Service for the Raft group: every pod gets a stable DNS name
+#   ledgerkv-raft-<ordinal>.ledgerkv-raft-headless.<namespace>.svc.cluster.local
+# It publishes both ports, because a member needs two addresses for its peers: 9090 is the
+# client endpoint a leader hint points at, 9095 carries consensus traffic.
+#
+# publishNotReadyAddresses is required, not merely convenient. Readiness here means "a leader is
+# known", and no leader can be elected until the members can resolve each other — waiting for
+# readiness before publishing DNS would deadlock the first election.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledgerkv-raft-headless
+  labels:
+    app: ledgerkv-raft
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: ledgerkv-raft
+  ports:
+    - name: grpc
+      port: 9090
+      targetPort: 9090
+    - name: raft
+      port: 9095
+      targetPort: 9095
+    - name: health
+      port: 8080
+      targetPort: 8080

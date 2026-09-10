@@ -1,0 +1,20 @@
+# Client front-door Service (ClusterIP): in-cluster clients dial ledgerkv-raft:9090.
+#
+# Unlike the quorum front door, round-robin here does not mean any pod can serve. Only the leader
+# can; the rest answer with its endpoint. Two things make that work. The readiness probe keeps
+# pods that know no leader out of this Service's endpoints, and a leader-aware client follows the
+# hint, so a request lands on the leader in at most two hops.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ledgerkv-raft
+  labels:
+    app: ledgerkv-raft
+spec:
+  type: ClusterIP
+  selector:
+    app: ledgerkv-raft
+  ports:
+    - name: grpc
+      port: 9090
+      targetPort: 9090

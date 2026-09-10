@@ -1,0 +1,110 @@
+# A 5-node LedgerKV Raft cluster. Every member holds the whole keyspace; a write commits once
+# three of the five have it. Run with: docker compose -f docker-compose.raft.yml up -d --build
+#
+# Separate from docker-compose.yml on purpose. A deployment runs one mode, and the two use
+# different storage: quorum mode writes an LSM engine per node, Raft mode writes a Raft log and
+# snapshots and opens no engine at all. Host ports differ too, so both stacks can be up at once.
+#
+# Client requests may be sent to any member. A follower answers with the leader's endpoint rather
+# than serving, so a leader-aware client (LedgerKvClusterClient) lands on the leader in one hop.
+
+x-node-env: &node-env
+  LEDGERKV_MODE: raft
+  LEDGERKV_CLUSTER_ID: ledgerkv
+  LEDGERKV_NODE_COUNT: "5"
+  LEDGERKV_GRPC_PORT: "9090"
+  LEDGERKV_RAFT_PORT: "9095"
+  LEDGERKV_HEALTH_PORT: "8080"
+  LEDGERKV_DATA_DIR: /data
+  LEDGERKV_PEERS: node0:9090,node1:9090,node2:9090,node3:9090,node4:9090
+  # Peer endpoints default to the client hosts on LEDGERKV_RAFT_PORT; spelled out here so the
+  # split between client traffic and consensus traffic is visible in the file.
+  LEDGERKV_RAFT_PEERS: node0:9095,node1:9095,node2:9095,node3:9095,node4:9095
+  # etcd's defaults: heartbeat near the round-trip time, election timeout 10-20x it. The peer RPC
+  # deadline sits below the shortest election timeout so one dead follower cannot hold a
+  # replication slot across the timeout meant to notice it is gone. NodeConfig enforces that.
+  LEDGERKV_RAFT_HEARTBEAT_MS: "100"
+  LEDGERKV_RAFT_ELECTION_MIN_TICKS: "10"
+  LEDGERKV_RAFT_ELECTION_MAX_TICKS: "20"
+  LEDGERKV_RAFT_RPC_DEADLINE_MS: "500"
+  LEDGERKV_RAFT_SNAPSHOT_THRESHOLD: "10000"
+
+# /health is liveness only. Readiness is /readyz, which goes 503 during an election — a container
+# healthcheck must not restart a follower just because its leader went away.
+x-node-healthcheck: &node-healthcheck
+  test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+  interval: 5s
+  timeout: 3s
+  retries: 5
+  start_period: 20s
+
+services:
+  node0:
+    build: .
+    image: ledgerkv:dev
+    environment:
+      <<: *node-env
+      LEDGERKV_NODE_INDEX: "0"
+    ports:
+      - "9190:9090"
+      - "8180:8080"
+    volumes:
+      - raft0-data:/data
+    healthcheck: *node-healthcheck
+
+  node1:
+    image: ledgerkv:dev
+    environment:
+      <<: *node-env
+      LEDGERKV_NODE_INDEX: "1"
+    ports:
+      - "9191:9090"
+      - "8181:8080"
+    volumes:
+      - raft1-data:/data
+    healthcheck: *node-healthcheck
+
+  node2:
+    image: ledgerkv:dev
+    environment:
+      <<: *node-env
+      LEDGERKV_NODE_INDEX: "2"
+    ports:
+      - "9192:9090"
+      - "8182:8080"
+    volumes:
+      - raft2-data:/data
+    healthcheck: *node-healthcheck
+
+  node3:
+    image: ledgerkv:dev
+    environment:
+      <<: *node-env
+      LEDGERKV_NODE_INDEX: "3"
+    ports:
+      - "9193:9090"
+      - "8183:8080"
+    volumes:
+      - raft3-data:/data
+    healthcheck: *node-healthcheck
+
+  node4:
+    image: ledgerkv:dev
+    environment:
+      <<: *node-env
+      LEDGERKV_NODE_INDEX: "4"
+    ports:
+      - "9194:9090"
+      - "8184:8080"
+    volumes:
+      - raft4-data:/data
+    healthcheck: *node-healthcheck
+
+# One volume per member. Sharing would let two members claim one Raft log; the cluster-identity
+# marker in /data turns that into a refusal to start rather than a corrupted log.
+volumes:
+  raft0-data:
+  raft1-data:
+  raft2-data:
+  raft3-data:
+  raft4-data:
