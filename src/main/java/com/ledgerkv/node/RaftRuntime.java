@@ -40,6 +40,8 @@ public final class RaftRuntime implements AutoCloseable {
     private final RaftServer server;
     private final List<RaftClient> clients;
     private final Map<String, String> endpoints;
+    private final java.util.concurrent.atomic.AtomicBoolean closed =
+            new java.util.concurrent.atomic.AtomicBoolean();
 
     private RaftRuntime(RaftNode node, RaftKvStateMachine state, RaftReplicationDriver driver,
             RaftServer server, List<RaftClient> clients, Map<String, String> endpoints) {
@@ -162,9 +164,15 @@ public final class RaftRuntime implements AutoCloseable {
     /**
      * Stops in the order that avoids work being handed to something already shut: replication
      * first, then peer channels, then the inbound server, and only then the durable log.
+     *
+     * <p>Idempotent, because shutdown is reached from more than one direction — a signal handler
+     * and a test's try-with-resources can both arrive — and closing the WAL twice throws.
      */
     @Override
     public void close() {
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
         driver.close();
         for (RaftClient client : clients) {
             try {

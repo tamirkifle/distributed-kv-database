@@ -39,6 +39,7 @@ public final class LedgerKvClusterClient implements AutoCloseable {
     private static final long SWEEP_PAUSE_MS = 25;
 
     private final List<String> endpoints;
+    /** One NodeClient per member, indexed alongside {@link #endpoints}. */
     private final List<NodeClient> members;
     private final String clientId;
     private final java.time.Duration deadline;
@@ -159,10 +160,13 @@ public final class LedgerKvClusterClient implements AutoCloseable {
                 }
                 target = next(target);
             } catch (StatusRuntimeException e) {
-                if (e.getStatus().getCode() == Status.Code.INVALID_ARGUMENT
-                        || e.getStatus().getCode() == Status.Code.UNIMPLEMENTED) {
+                if (e.getStatus().getCode() == Status.Code.INVALID_ARGUMENT) {
                     throw e; // the request itself is wrong; another member would say the same
                 }
+                // Everything else is worth asking someone else, UNIMPLEMENTED included. This
+                // client exposes no operation that a healthy member refuses, so UNIMPLEMENTED
+                // means the address is not the member we think it is — a port reused after a
+                // node died, say — which is precisely a reason to move on.
                 last = e;
                 target = next(target);
             }

@@ -176,9 +176,7 @@ class RaftModeEndToEndTest {
             servers.forEach(s -> {
                 try { s.close(); } catch (Exception e) { /* best effort, may already be stopped */ }
             });
-            runtimes.forEach(r -> {
-                try { r.close(); } catch (RuntimeException e) { /* already stopped */ }
-            });
+            runtimes.forEach(RaftRuntime::close); // idempotent: some may already be stopped
         }
     }
 
