@@ -159,9 +159,19 @@ public final class RaftClientCoordinator implements ClientCoordinator {
         return id;
     }
 
+    /**
+     * The redirect to send when this node cannot serve. Sending no hint when this node still
+     * believes it is the leader is deliberate: reaching here means leadership could not be
+     * confirmed or the entry did not commit, so that belief is exactly the thing in doubt.
+     * Naming ourselves would tell the client to come straight back, and it would do so until its
+     * deadline ran out.
+     */
     private NotLeaderException notLeader() {
         String leader = node.leaderId();
-        return new NotLeaderException(leader, leader == null ? null : endpoints.get(leader));
+        if (leader == null || leader.equals(node.nodeId())) {
+            return new NotLeaderException(null, null);
+        }
+        return new NotLeaderException(leader, endpoints.get(leader));
     }
 
     private static StoredValue stored(byte[] value, long version) {

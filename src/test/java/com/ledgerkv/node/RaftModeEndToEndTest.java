@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -137,6 +138,23 @@ class RaftModeEndToEndTest {
         String awaitSettledLeader() throws InterruptedException {
             awaitLeaderClient();
             return runtimes.get(0).node().leaderId();
+        }
+
+        /**
+         * Stops every member but the leader and one follower, then returns a client pointed at the
+         * stranded leader. Two of five cannot reach a majority.
+         */
+        NodeClient stripToMinorityAroundLeader() throws Exception {
+            String leader = awaitSettledLeader();
+            int leaderIndex = clientIndexById.get(leader);
+            int spared = leaderIndex == 0 ? 1 : 0;
+            for (int i = 0; i < runtimes.size(); i++) {
+                if (i != leaderIndex && i != spared) {
+                    servers.get(i).close();
+                    runtimes.get(i).close();
+                }
+            }
+            return clients.get(leaderIndex);
         }
 
         NodeClient anyFollowerClient() throws InterruptedException {
@@ -297,6 +315,40 @@ class RaftModeEndToEndTest {
                 assertArrayEquals("2".getBytes(UTF_8),
                         client.get("after").orElseThrow(AssertionError::new));
             }
+        }
+    }
+
+    @Test
+    void aMinorityRefusesRatherThanServingStaleData(@TempDir Path root) throws Exception {
+        try (Cluster cluster = new Cluster(root, 5)) {
+            cluster.awaitLeaderClient();
+            try (LedgerKvClusterClient client = LedgerKvClusterClient.connect(
+                    cluster.endpoints, "app-1", Duration.ofSeconds(10))) {
+                client.put("k", "committed".getBytes(UTF_8));
+            }
+
+            // Strand the leader itself with one follower: two of five, below the three needed to
+            // commit. Keeping the leader is the point. It has the committed value in memory and
+            // still believes it leads, so it is the node most likely to answer when it must not.
+            NodeClient stranded = cluster.stripToMinorityAroundLeader();
+
+            NotLeaderException read = assertThrows(NotLeaderException.class,
+                    () -> stranded.getSiblings("k"),
+                    "no majority can confirm leadership, so the read must be refused");
+            assertNull(read.leaderEndpoint(),
+                    "and it must not name itself: it cannot know it is still the leader");
+
+            // Not a redirect, and deliberately so. The entry is in this leader's log and could
+            // still commit if the majority came back, so the outcome is unknown rather than
+            // misdirected. UNAVAILABLE says "retry"; a NotLeader hint would claim knowledge the
+            // node does not have.
+            StatusRuntimeException write = assertThrows(StatusRuntimeException.class,
+                    () -> stranded.put("k", "minority".getBytes(UTF_8), MutationId.of("c9", 1)),
+                    "a minority cannot commit, so it must not acknowledge the write");
+            assertEquals(Status.Code.UNAVAILABLE, write.getStatus().getCode());
+
+            // Whatever happened to that proposal, it must not be visible as a committed value.
+            assertThrows(NotLeaderException.class, () -> stranded.getSiblings("k"));
         }
     }
 
