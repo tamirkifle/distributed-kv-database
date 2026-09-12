@@ -48,6 +48,14 @@ public final class RaftNode {
     private int electionElapsed = 0;
     private int electionTimeout;
 
+    /**
+     * Ticks since this node started, and the tick at which each peer last acknowledged this leader.
+     * Used only to answer "can this node still serve?" for the readiness endpoint — never to make a
+     * consensus decision — so it stays on the logical clock rather than introducing a wall clock.
+     */
+    private long ticks = 0;
+    private final Map<String, Long> lastAckTick = new HashMap<>();
+
     // Candidate state.
     private final Set<String> votesReceived = new HashSet<>();
 
@@ -325,6 +333,7 @@ public final class RaftNode {
     }
 
     public synchronized void tick() {
+        ticks++;
         if (role == RaftRole.LEADER) {
             if (replicationDelegated) {
                 return; // the driver's per-peer threads own replication
@@ -405,6 +414,7 @@ public final class RaftNode {
      * {@link #recordVote}. Returns null when no election started.
      */
     public synchronized RequestVoteRequest tickForDriver() {
+        ticks++;
         if (role == RaftRole.LEADER) {
             return null; // the driver's peer threads own the leader's heartbeats
         }
@@ -596,6 +606,7 @@ public final class RaftNode {
             return; // stale reply from an earlier term or role
         }
         if (resp.success()) {
+            lastAckTick.put(peerId, ticks);
             // Replies can arrive out of order once peers run on their own threads, so match
             // progress only ever moves forward within a term.
             long matched = Math.max(matchIndex.getOrDefault(peerId, 0L), resp.matchIndex());
@@ -617,6 +628,7 @@ public final class RaftNode {
         if (role != RaftRole.LEADER) {
             return;
         }
+        lastAckTick.put(peerId, ticks);
         long matched = Math.max(matchIndex.getOrDefault(peerId, 0L), lastIncludedIndex);
         matchIndex.put(peerId, matched);
         nextIndex.put(peerId, matched + 1);
@@ -625,6 +637,38 @@ public final class RaftNode {
 
     public long lastApplied() {
         return lastApplied;
+    }
+
+    /**
+     * Whether this node could serve or usefully redirect a client request right now, where
+     * {@code staleTicks} is how long contact may lapse before it stops counting — one election
+     * timeout is the natural setting.
+     *
+     * <p>A leader needs a majority to have acknowledged it recently. Knowing its own role is not
+     * enough: a leader cut off from the cluster keeps the title until it hears a higher term, and
+     * in the meantime it can neither commit a write nor confirm a read.
+     *
+     * <p>A follower only needs to have heard from a leader recently, and that is weaker than it
+     * looks. A follower stranded in a minority alongside its leader keeps receiving heartbeats, so
+     * it keeps reporting itself able to redirect, to a leader that will refuse. Closing that gap
+     * means asking the leader whether it still holds a majority, which is a round trip this check
+     * exists to avoid — etcd pays it, running a linearizable read on every {@code /readyz}. The
+     * consequence is bounded: the leader itself reports not-ready and drops out, so the redirect
+     * costs a client one wasted hop before it fails, rather than returning stale data.
+     *
+     * <p>Never used for a consensus decision, only for reporting.
+     */
+    public synchronized boolean canServe(int staleTicks) {
+        if (role == RaftRole.LEADER) {
+            int fresh = 1; // the leader counts itself
+            for (String peerId : peerIds) {
+                if (ticks - lastAckTick.getOrDefault(peerId, Long.MIN_VALUE) <= staleTicks) {
+                    fresh++;
+                }
+            }
+            return hasMajority(fresh);
+        }
+        return leaderId != null && electionElapsed < electionTimeout;
     }
 
     /** Injectable compaction trigger: compact once this many physical applied entries accumulate. */

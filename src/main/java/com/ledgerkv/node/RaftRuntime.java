@@ -42,10 +42,14 @@ public final class RaftRuntime implements AutoCloseable {
     private final Map<String, String> endpoints;
     private final java.util.concurrent.atomic.AtomicBoolean closed =
             new java.util.concurrent.atomic.AtomicBoolean();
+    /** How long contact may lapse before readiness stops counting it: one election timeout. */
+    private final int staleTicks;
 
     private RaftRuntime(RaftNode node, RaftKvStateMachine state, RaftReplicationDriver driver,
-            RaftServer server, List<RaftClient> clients, Map<String, String> endpoints) {
+            RaftServer server, List<RaftClient> clients, Map<String, String> endpoints,
+            int staleTicks) {
         this.node = node;
+        this.staleTicks = staleTicks;
         this.state = state;
         this.driver = driver;
         this.server = server;
@@ -99,7 +103,8 @@ public final class RaftRuntime implements AutoCloseable {
         RaftReplicationDriver driver =
                 new RaftReplicationDriver(node, peers, config.raftHeartbeat()).start();
 
-        return new RaftRuntime(node, state, driver, server, clients, clientEndpoints(config));
+        return new RaftRuntime(node, state, driver, server, clients, clientEndpoints(config),
+                config.raftElectionMaxTicks());
     }
 
     /** Member ids in peer-list order, so index i names the member at {@code peers().get(i)}. */
@@ -154,11 +159,12 @@ public final class RaftRuntime implements AutoCloseable {
     }
 
     /**
-     * Whether this node can currently take part in serving requests: it either leads, or it knows
-     * who does and can redirect. During an election it can do neither, and says so.
+     * Whether this node can currently take part in serving requests: it either leads with a
+     * majority still behind it, or it has heard from a leader recently enough to redirect there.
+     * During an election, and inside a stranded minority, it can do neither and says so.
      */
     public boolean ready() {
-        return node.leaderId() != null;
+        return node.canServe(staleTicks);
     }
 
     /**

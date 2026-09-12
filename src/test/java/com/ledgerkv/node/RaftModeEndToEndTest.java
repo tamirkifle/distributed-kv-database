@@ -54,6 +54,7 @@ class RaftModeEndToEndTest {
         final List<NodeClient> clients = new ArrayList<>();
         final Map<String, Integer> clientIndexById = new LinkedHashMap<>();
         final List<String> endpoints = new ArrayList<>();
+        final java.util.Set<String> stopped = new java.util.HashSet<>();
 
         Cluster(Path root, int size) throws IOException {
             this(root, allocate(size), allocate(size));
@@ -129,10 +130,13 @@ class RaftModeEndToEndTest {
 
         /** Stops the current leader outright, the way a SIGKILL would. */
         void stopLeader() throws Exception {
-            String leader = awaitSettledLeader();
-            int index = clientIndexById.get(leader);
+            stop(clientIndexById.get(awaitSettledLeader()));
+        }
+
+        private void stop(int index) throws Exception {
             servers.get(index).close();
             runtimes.get(index).close();
+            stopped.add(runtimes.get(index).node().nodeId());
         }
 
         String awaitSettledLeader() throws InterruptedException {
@@ -150,11 +154,25 @@ class RaftModeEndToEndTest {
             int spared = leaderIndex == 0 ? 1 : 0;
             for (int i = 0; i < runtimes.size(); i++) {
                 if (i != leaderIndex && i != spared) {
-                    servers.get(i).close();
-                    runtimes.get(i).close();
+                    stop(i);
                 }
             }
             return clients.get(leaderIndex);
+        }
+
+        RaftRuntime runtimeFor(String nodeId) {
+            return runtimes.get(clientIndexById.get(nodeId));
+        }
+
+        /** The runtimes that have not been stopped. */
+        List<RaftRuntime> runningRuntimes() {
+            List<RaftRuntime> running = new ArrayList<>();
+            for (RaftRuntime runtime : runtimes) {
+                if (!stopped.contains(runtime.node().nodeId())) {
+                    running.add(runtime);
+                }
+            }
+            return running;
         }
 
         NodeClient anyFollowerClient() throws InterruptedException {
@@ -347,6 +365,22 @@ class RaftModeEndToEndTest {
 
             // Whatever happened to that proposal, it must not be visible as a committed value.
             assertThrows(NotLeaderException.class, () -> stranded.getSiblings("k"));
+
+            // Readiness has to follow, or the node keeps collecting traffic it cannot serve.
+            RaftRuntime strandedLeader = cluster.runtimeFor(cluster.awaitSettledLeader());
+            assertFalse(strandedLeader.ready(),
+                    "a leader without majority support must drop out of the client Service");
+
+            // The surviving follower is a known gap, pinned here rather than left to drift. It is
+            // still being heartbeated by the stranded leader, so it reports ready and will redirect
+            // there; the leader then refuses. That costs a wasted hop, never a stale answer, and
+            // closing it would mean a leadership round trip on every readiness probe.
+            for (RaftRuntime runtime : cluster.runningRuntimes()) {
+                if (runtime != strandedLeader) {
+                    assertTrue(runtime.ready(),
+                            "a follower cannot tell that the leader heartbeating it is stranded");
+                }
+            }
         }
     }
 
