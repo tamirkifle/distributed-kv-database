@@ -37,6 +37,23 @@ final class HistoryBuilder {
         return this;
     }
 
+    HistoryBuilder failedWrite(String key, String value, long startTick, long endTick) {
+        operations.add(record(OperationType.WRITE, key, value, startTick, endTick, OperationResult.FAILURE));
+        return this;
+    }
+
+    /** A write whose client timed out: it may have taken effect, then or later, or never. */
+    HistoryBuilder unknownWrite(String key, String value, long startTick, long endTick) {
+        operations.add(record(OperationType.WRITE, key, value, startTick, endTick, OperationResult.UNKNOWN));
+        return this;
+    }
+
+    /** A read whose client timed out holding no value. */
+    HistoryBuilder unknownRead(String key, long startTick, long endTick) {
+        operations.add(record(OperationType.READ, key, null, startTick, endTick, OperationResult.UNKNOWN));
+        return this;
+    }
+
     OperationHistory build() {
         return new OperationHistory(operations);
     }

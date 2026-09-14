@@ -29,9 +29,27 @@ import java.util.Set;
  * valid linearization of the supplied history — and comes with a witness for debugging. This is
  * exactly how Jepsen's Knossos/Porcupine checkers are positioned.
  *
- * <p>Failed operations ({@link OperationResult#FAILURE}) are omitted from the search: a client that
- * saw a failure learned nothing about the register's state, so the op places no constraint on the
- * linearization.
+ * <h2>Operations whose outcome the client never learned</h2>
+ *
+ * <p>Three results, treated three ways:
+ *
+ * <ul>
+ *   <li>{@link OperationResult#SUCCESS} — must appear in the linearization, inside its real-time
+ *       bounds.
+ *   <li>{@link OperationResult#FAILURE} — definitely never took effect, so it is omitted. The
+ *       client learned nothing about the register and the op constrains nothing.
+ *   <li>{@link OperationResult#UNKNOWN} — a timeout or a killed node. The search may place it
+ *       <em>or</em> leave it out, whichever admits a valid order, which is how Jepsen treats an
+ *       {@code :info} op.
+ * </ul>
+ *
+ * <p>An unknown write also has no end: the client stopped waiting, but the entry may commit long
+ * afterwards, so nothing can be required to follow it. Only its invocation time constrains what
+ * may precede it. An unknown <em>read</em> returned no value and is simply dropped.
+ *
+ * <p>Folding unknowns into failures is what makes a correct checker lie. The write disappears from
+ * the history, a later read observes the value it wrote, no writer exists for that value, and the
+ * checker reports a violation that never happened.
  */
 public final class LinearizabilityChecker {
 
@@ -61,8 +79,8 @@ public final class LinearizabilityChecker {
         // Partition by key (Lowe). LinkedHashMap so the first-failing key is deterministic.
         Map<String, List<OperationRecord>> byKey = new LinkedHashMap<>();
         for (OperationRecord op : history.getOperations()) {
-            if (op.getResult() == OperationResult.FAILURE) {
-                continue; // failed ops carry no constraint
+            if (!constrains(op)) {
+                continue;
             }
             byKey.computeIfAbsent(op.getKey(), k -> new ArrayList<>()).add(op);
         }
@@ -83,11 +101,32 @@ public final class LinearizabilityChecker {
         return LinearizabilityResult.linearizable();
     }
 
+    /**
+     * Whether this op says anything about the register. A definite failure does not. Neither does
+     * an unknown read: the client timed out holding no value, so there is nothing to explain.
+     */
+    private static boolean constrains(OperationRecord op) {
+        if (op.getResult() == OperationResult.FAILURE) {
+            return false;
+        }
+        return op.getResult() != OperationResult.UNKNOWN || op.getType() == OperationType.WRITE;
+    }
+
+    /** An unknown write may still be applied after the client gave up, so it has no end. */
+    private static boolean optional(OperationRecord op) {
+        return op.getResult() == OperationResult.UNKNOWN;
+    }
+
     private LinearizabilityResult checkKey(String key, List<OperationRecord> ops) {
         int n = ops.size();
-        // Precompute real-time-before: before[i][j] == true iff ops[i].end < ops[j].start.
+        // Precompute real-time-before: before[i][j] == true iff ops[i].end < ops[j].start. An
+        // optional op has no end, so it is never required to precede anything — which also means
+        // leaving it out of the order can never block an op that was waiting behind it.
         boolean[][] before = new boolean[n][n];
         for (int i = 0; i < n; i++) {
+            if (optional(ops.get(i))) {
+                continue;
+            }
             for (int j = 0; j < n; j++) {
                 if (i != j && ops.get(i).getEndTime().isBefore(ops.get(j).getStartTime())) {
                     before[i][j] = true;
@@ -95,16 +134,24 @@ public final class LinearizabilityChecker {
             }
         }
 
+        int mandatory = 0;
+        for (OperationRecord op : ops) {
+            if (!optional(op)) {
+                mandatory++;
+            }
+        }
+
         Set<MemoKey> failedPrefixes = new HashSet<>();
         List<String> prefix = new ArrayList<>();
         Set<Integer> linearized = new HashSet<>();
-        List<String> stuckFrontier = new ArrayList<>();
+        Witness witness = new Witness();
 
-        boolean ok = search(ops, before, null, linearized, prefix, failedPrefixes, stuckFrontier);
+        boolean ok =
+                search(ops, before, mandatory, null, linearized, prefix, failedPrefixes, witness);
         if (ok) {
             return LinearizabilityResult.linearizable();
         }
-        return LinearizabilityResult.notLinearizable(key, prefix, stuckFrontier);
+        return LinearizabilityResult.notLinearizable(key, witness.prefix, witness.frontier);
     }
 
     /**
@@ -115,12 +162,15 @@ public final class LinearizabilityChecker {
      */
     private boolean search(List<OperationRecord> ops,
                            boolean[][] before,
+                           int mandatoryRemaining,
                            String registerValue,
                            Set<Integer> linearized,
                            List<String> prefix,
                            Set<MemoKey> failedPrefixes,
-                           List<String> stuckFrontier) {
-        if (linearized.size() == ops.size()) {
+                           Witness witness) {
+        // Done once every op the client got an answer for is placed. Unknown ops still pending at
+        // that point are the ones that never took effect, which is a legal reading of the history.
+        if (mandatoryRemaining == 0) {
             return true;
         }
 
@@ -159,20 +209,51 @@ public final class LinearizabilityChecker {
             String nextValue = (op.getType() == OperationType.WRITE) ? op.getValue() : registerValue;
             linearized.add(i);
             prefix.add(describe(op));
-            if (search(ops, before, nextValue, linearized, prefix, failedPrefixes, stuckFrontier)) {
+            if (search(ops, before, mandatoryRemaining - (optional(op) ? 0 : 1), nextValue,
+                    linearized, prefix, failedPrefixes, witness)) {
                 return true;
             }
             prefix.remove(prefix.size() - 1);
             linearized.remove(i);
         }
 
-        // Dead end: memoize, and record the deepest stuck frontier seen (witness).
         failedPrefixes.add(memoKey);
-        if (stuckFrontier.isEmpty() || !nonFittingFrontier.isEmpty()) {
-            stuckFrontier.clear();
-            stuckFrontier.addAll(nonFittingFrontier);
-        }
+        witness.record(prefix, nonFittingFrontier);
         return false;
+    }
+
+    /**
+     * The best dead end seen so far, kept for the failure report.
+     *
+     * <p>It has to be a copy. {@code prefix} is one list mutated in place as the search descends
+     * and unwinds, so by the time the top-level call returns false it is empty again — which is
+     * what every non-linearizable verdict used to carry.
+     */
+    private static final class Witness {
+        final List<String> prefix = new ArrayList<>();
+        final List<String> frontier = new ArrayList<>();
+        private int depth = -1;
+
+        /**
+         * Prefers a dead end that can name the operations that would not fit, and among those the
+         * one reached after linearizing the most operations: that is the longest story the checker
+         * can tell before it runs out of legal moves.
+         */
+        void record(List<String> linearizedSoFar, List<String> nonFitting) {
+            boolean informative = !nonFitting.isEmpty();
+            boolean haveInformative = !frontier.isEmpty();
+            if (haveInformative && !informative) {
+                return; // never trade a named blocker for an unexplained dead end
+            }
+            if (informative == haveInformative && linearizedSoFar.size() <= depth) {
+                return;
+            }
+            depth = linearizedSoFar.size();
+            prefix.clear();
+            prefix.addAll(linearizedSoFar);
+            frontier.clear();
+            frontier.addAll(nonFitting);
+        }
     }
 
     private static boolean fits(OperationRecord op, String registerValue) {
@@ -183,7 +264,8 @@ public final class LinearizabilityChecker {
     }
 
     private static String describe(OperationRecord op) {
-        return op.getType() + " " + op.getKey() + "=" + op.getValue();
+        String suffix = optional(op) ? " (outcome unknown)" : "";
+        return op.getType() + " " + op.getKey() + "=" + op.getValue() + suffix;
     }
 
     /**
