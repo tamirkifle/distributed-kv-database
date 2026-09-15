@@ -98,13 +98,19 @@ public final class RaftReplicationDriver implements AutoCloseable {
     }
 
     /**
-     * Proposes a command and returns once <em>this</em> entry is committed and applied, or throws
-     * on timeout. The calling thread performs no peer I/O and holds no node lock while waiting.
+     * Proposes a command and returns once <em>this</em> entry is committed and applied.
+     *
+     * <p>The two failures are different and callers must treat them differently. A
+     * {@link ProposalRejectedException} means nothing was appended, so the command did not happen.
+     * A plain {@link IllegalStateException} means the entry is in the log but did not commit in
+     * time, so the outcome is unknown and it may yet commit.
+     *
+     * <p>The calling thread performs no peer I/O and holds no node lock while waiting.
      */
     public long propose(byte[] command, Duration timeout) throws InterruptedException {
         long index = node.proposeLocal(command);
         if (index == 0) {
-            throw new IllegalStateException("target node is not the leader");
+            throw new ProposalRejectedException("target node is not the leader");
         }
         signal(); // replicate now rather than at the next heartbeat
         if (!node.awaitApplied(index, timeout)) {
@@ -129,10 +135,10 @@ public final class RaftReplicationDriver implements AutoCloseable {
         // compares against the older term and refuses. The other order could let it slip through.
         long term = node.currentTerm();
 
-        // Step 1. A leader may not trust its commit index until an entry from its own term has
-        // committed; becomeLeader() appends the no-op barrier that makes that true within a
-        // replication round. Wait for it, as §6.4 step 1 says to, instead of failing every read
-        // issued in the first moments of a term.
+        // A leader may not trust its commit index until an entry from its own term has committed,
+        // and becomeLeader() appends the no-op barrier that makes that true within a replication
+        // round. Ongaro §6.4 says to wait for it rather than refuse, which matters because
+        // otherwise every read issued in the first moments of a term fails for no good reason.
         long index = node.readIndexCandidate();
         while (index < 0) {
             if (!node.isLeader() || System.nanoTime() >= deadline) {

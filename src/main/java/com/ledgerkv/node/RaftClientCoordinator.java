@@ -4,6 +4,7 @@ import com.ledgerkv.consistency.VersionMetadata;
 import com.ledgerkv.metrics.OperationMetrics;
 import com.ledgerkv.metrics.OperationMetricsCollector;
 import com.ledgerkv.raft.RaftNode;
+import com.ledgerkv.raft.ProposalRejectedException;
 import com.ledgerkv.raft.RaftReplicationDriver;
 import com.ledgerkv.raft.kv.KvCommand;
 import com.ledgerkv.raft.kv.KvOutcome;
@@ -120,12 +121,14 @@ public final class RaftClientCoordinator implements ClientCoordinator {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("interrupted awaiting commit of " + command, e);
-        } catch (IllegalStateException failed) {
+        } catch (ProposalRejectedException rejected) {
             metrics.recordOperation(false, false, millisSince(start));
-            // propose() fails both when this node was never the leader and when the entry did not
-            // commit in time. The second outcome is genuinely unknown: the entry may still commit,
-            // so the caller has to retry with the same id rather than assume the write was lost.
-            throw node.isLeader() ? failed : notLeader();
+            throw notLeader(); // nothing was appended, so the write definitely did not happen
+        } catch (IllegalStateException timedOut) {
+            metrics.recordOperation(false, false, millisSince(start));
+            // The entry is in the log and may still commit. Surfacing this as a redirect would
+            // tell the caller it definitely did not happen, which is the one thing we do not know.
+            throw timedOut;
         }
 
         KvOutcome outcome =

@@ -17,9 +17,11 @@ import com.ledgerkv.transport.proto.ScanRequest;
 import com.ledgerkv.transport.proto.VersionedValuePb;
 import io.grpc.ManagedChannel;
 import io.grpc.netty.shaded.io.grpc.netty.NettyChannelBuilder;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
@@ -27,22 +29,42 @@ import java.util.concurrent.TimeUnit;
  * A blocking client for the {@code LedgerKvNode} service. Wraps a {@link ManagedChannel}
  * and the generated blocking stub, mapping to/from the proto messages so callers work in
  * plain Java types.
+ *
+ * <p>Every call carries a deadline. A blocking stub without one waits forever, and "forever" is
+ * reachable: a node that is partitioned but still running accepts the connection and then never
+ * answers. A caller that wraps this in its own retry budget does not help, because the budget is
+ * only consulted between attempts and the first attempt never returns.
  */
 public final class NodeClient implements AutoCloseable {
 
-    private final ManagedChannel channel;
-    private final LedgerKvNodeGrpc.LedgerKvNodeBlockingStub stub;
+    /** Generous next to a healthy request, finite next to a hang. */
+    private static final Duration DEFAULT_DEADLINE = Duration.ofSeconds(10);
 
-    private NodeClient(ManagedChannel channel) {
+    private final ManagedChannel channel;
+    private final LedgerKvNodeGrpc.LedgerKvNodeBlockingStub blockingStub;
+    private final Duration deadline;
+
+    private NodeClient(ManagedChannel channel, Duration deadline) {
         this.channel = channel;
-        this.stub = LedgerKvNodeGrpc.newBlockingStub(channel);
+        this.blockingStub = LedgerKvNodeGrpc.newBlockingStub(channel);
+        this.deadline = deadline;
     }
 
     public static NodeClient connect(String host, int port) {
+        return connect(host, port, DEFAULT_DEADLINE);
+    }
+
+    /** Connects with an explicit per-RPC deadline. */
+    public static NodeClient connect(String host, int port, Duration deadline) {
         ManagedChannel channel = NettyChannelBuilder.forAddress(host, port)
                 .usePlaintext()
                 .build();
-        return new NodeClient(channel);
+        return new NodeClient(channel, Objects.requireNonNull(deadline, "deadline"));
+    }
+
+    /** The stub with this client's deadline applied; deadlines are per-call, not per-stub. */
+    private LedgerKvNodeGrpc.LedgerKvNodeBlockingStub stub() {
+        return blockingStub.withDeadlineAfter(deadline.toMillis(), TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -70,7 +92,7 @@ public final class NodeClient implements AutoCloseable {
      * HTTP 300 Multiple Choices with the sibling list.
      */
     public List<StoredValue> getSiblings(String key) {
-        GetResponse response = stub.get(GetRequest.newBuilder().setKey(key).build());
+        GetResponse response = stub().get(GetRequest.newBuilder().setKey(key).build());
         throwIfRedirected(response.hasNotLeader() ? response.getNotLeader() : null);
         List<StoredValue> siblings = new ArrayList<>();
         for (VersionedValuePb sibling : response.getSiblingsList()) {
@@ -98,7 +120,7 @@ public final class NodeClient implements AutoCloseable {
         if (id.isPresent()) {
             request.setClientId(id.clientId()).setSequence(id.sequence());
         }
-        PutResponse response = stub.put(request.build());
+        PutResponse response = stub().put(request.build());
         throwIfRedirected(response.hasNotLeader() ? response.getNotLeader() : null);
         return response.getVersion();
     }
@@ -114,7 +136,7 @@ public final class NodeClient implements AutoCloseable {
         if (id.isPresent()) {
             request.setClientId(id.clientId()).setSequence(id.sequence());
         }
-        DeleteResponse response = stub.delete(request.build());
+        DeleteResponse response = stub().delete(request.build());
         throwIfRedirected(response.hasNotLeader() ? response.getNotLeader() : null);
         return response.getExisted();
     }
@@ -135,7 +157,7 @@ public final class NodeClient implements AutoCloseable {
 
     /** Scans {@code [start, end)} in ascending key order, up to {@code limit} entries. */
     public List<ScanEntry> scan(String start, String end, int limit) {
-        Iterator<ScanEntry> stream = stub.scan(ScanRequest.newBuilder()
+        Iterator<ScanEntry> stream = stub().scan(ScanRequest.newBuilder()
                 .setStartKey(start)
                 .setEndKey(end)
                 .setLimit(limit)
@@ -153,7 +175,7 @@ public final class NodeClient implements AutoCloseable {
      */
     public List<StoredValue> replicaGet(String key) {
         ReplicaGetResponse response =
-                stub.replicaGet(ReplicaGetRequest.newBuilder().setKey(key).build());
+                stub().replicaGet(ReplicaGetRequest.newBuilder().setKey(key).build());
         List<StoredValue> siblings = new ArrayList<>();
         for (VersionedValuePb sibling : response.getSiblingsList()) {
             siblings.add(VersionedValueProtos.fromProto(sibling));
@@ -163,7 +185,7 @@ public final class NodeClient implements AutoCloseable {
 
     /** Internal replica write: stores {@code value} under {@code key} verbatim (no re-versioning). */
     public void replicaPut(String key, StoredValue value) {
-        stub.replicaPut(ReplicaPutRequest.newBuilder()
+        stub().replicaPut(ReplicaPutRequest.newBuilder()
                 .setKey(key)
                 .setValue(VersionedValueProtos.toProto(value))
                 .build());
@@ -171,7 +193,7 @@ public final class NodeClient implements AutoCloseable {
 
     /** Delivers a hinted-handoff write for {@code targetNodeId} to this node, stored verbatim. */
     public void deliverHint(String targetNodeId, String key, StoredValue value) {
-        stub.deliverHint(HintRequest.newBuilder()
+        stub().deliverHint(HintRequest.newBuilder()
                 .setTargetNode(targetNodeId)
                 .setKey(key)
                 .setValue(VersionedValueProtos.toProto(value))

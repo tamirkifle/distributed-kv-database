@@ -72,7 +72,11 @@ public final class LedgerKvClusterClient implements AutoCloseable {
         List<NodeClient> members = new ArrayList<>();
         for (String endpoint : endpoints) {
             String[] hostPort = endpoint.split(":", 2);
-            members.add(NodeClient.connect(hostPort[0], Integer.parseInt(hostPort[1])));
+            // One attempt may not outlast the budget for all of them. Without this a single
+            // unresponsive member — partitioned but still accepting connections — consumes the
+            // whole deadline in one call, and the other members are never tried at all.
+            members.add(NodeClient.connect(
+                    hostPort[0], Integer.parseInt(hostPort[1]), deadline));
         }
         return new LedgerKvClusterClient(
                 new ArrayList<>(endpoints), members, clientId, deadline);
