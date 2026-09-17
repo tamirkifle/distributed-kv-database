@@ -58,6 +58,18 @@ public final class CorrectnessExperiment {
     /** What is done to the cluster while a history is being recorded. */
     public enum Scenario { HEALTHY, LEADER_LOSS, PARTITION_3_2, RESTART }
 
+    /**
+     * Distinguishes this process's keys from every earlier run's.
+     *
+     * <p>Keys must be fresh, not merely unique within a run. A cluster is not wiped between
+     * scenarios, so a key named only after its seed is re-read in the next scenario with the
+     * previous scenario's value still in it. Every history then opens with reads of a value no
+     * write in that history explains, and the checker correctly calls all of them violations —
+     * which looks exactly like a database that loses its mind under fault injection.
+     */
+    private static final String RUN_ID =
+            Long.toUnsignedString(System.currentTimeMillis(), 36);
+
     private CorrectnessExperiment() {
     }
 
@@ -95,7 +107,7 @@ public final class CorrectnessExperiment {
         List<Outcome> counterexamples = new ArrayList<>();
 
         System.out.println("exp-01 scenario=" + settings.scenario + " histories="
-                + settings.histories + " baseSeed=" + settings.seed);
+                + settings.histories + " baseSeed=" + settings.seed + " runId=" + RUN_ID);
         // Warm the network lookup while every container is still attached; see ClusterFaults.
         faults.resolveNetwork();
         try {
@@ -137,14 +149,17 @@ public final class CorrectnessExperiment {
 
     private static Outcome runOne(long seed, Settings settings, ClusterProbe probe,
             ClusterFaults faults) throws Exception {
-        Optional<String> leader = probe.awaitLeader(Duration.ofSeconds(30));
+        Optional<String> leader = probe.awaitLeader(Duration.ofSeconds(60));
         if (leader.isEmpty()) {
-            throw new IllegalStateException("no leader before history seed=" + seed);
+            throw new IllegalStateException("no leader within 60s before history seed=" + seed
+                    + "; the cluster did not re-form after the previous history's faults, so"
+                    + " every later verdict would be measuring a broken deployment");
         }
 
         faults.clearEvents(); // each history reports only the faults injected during it
         // One key per history keeps every recorded operation inside one register's search space.
-        String key = "exp01-" + seed;
+        String key = "exp01-" + RUN_ID + "-" + settings.scenario.name().toLowerCase(
+                java.util.Locale.ROOT) + "-" + seed;
         HistoryRecorder recorder = new HistoryRecorder();
         Random random = new Random(seed);
 
@@ -176,7 +191,8 @@ public final class CorrectnessExperiment {
                 });
             }
 
-            Thread fault = faultThread(settings.scenario, faults, recorder, leader.get(), random);
+            Thread fault = faultThread(
+                    settings.scenario, faults, recorder, leader.get(), random, settings.services);
             start.countDown();
             if (fault != null) {
                 fault.start();
@@ -216,7 +232,7 @@ public final class CorrectnessExperiment {
     }
 
     private static Thread faultThread(Scenario scenario, ClusterFaults faults,
-            HistoryRecorder recorder, String leader, Random random) {
+            HistoryRecorder recorder, String leader, Random random, List<String> services) {
         if (scenario == Scenario.HEALTHY) {
             return null;
         }
@@ -230,7 +246,7 @@ public final class CorrectnessExperiment {
                     case PARTITION_3_2:
                         // The leader plus one peer, cut off from the other three.
                         faults.partition(leader);
-                        faults.partition(otherThan(faults, leader, random));
+                        faults.partition(otherThan(services, leader, random));
                         break;
                     case RESTART:
                         faults.restartAll();
@@ -255,9 +271,8 @@ public final class CorrectnessExperiment {
         }
     }
 
-    private static String otherThan(ClusterFaults faults, String leader, Random random) {
-        List<String> candidates = new ArrayList<>(
-                Arrays.asList("node0", "node1", "node2", "node3", "node4"));
+    private static String otherThan(List<String> services, String leader, Random random) {
+        List<String> candidates = new ArrayList<>(services);
         candidates.remove(leader);
         return candidates.get(random.nextInt(candidates.size()));
     }
