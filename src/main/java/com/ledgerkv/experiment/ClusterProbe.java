@@ -12,6 +12,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Reads Raft state off each member's {@code /metrics} endpoint.
@@ -19,10 +21,19 @@ import java.util.Optional;
  * <p>Experiments need the leader's identity, and guessing it from a node index is how a failover
  * measurement quietly stops measuring failover. Asking the cluster costs one HTTP call per member
  * and is correct across every election.
+ *
+ * <p>Which member answered is taken from the {@code node} label in the response, never from which
+ * URL was dialled. Those disagree in practice: detaching and reattaching a container to the
+ * Compose network can leave the host's published ports crossed, so port 8180 starts answering for
+ * a different member than it did at startup. A harness that trusted the port would then read the
+ * leader's role off one container and kill another, and every failover number it produced would
+ * be timing the loss of a follower.
  */
 public final class ClusterProbe {
 
-    /** Health-port base URLs, in member order. */
+    private static final Pattern NODE_LABEL = Pattern.compile("node=\"[^\"]*-node-(\\d+)\"");
+
+    /** Health-port base URLs; which member each answers for is read from the response. */
     private final List<String> healthUrls;
     private final List<String> services;
 
@@ -33,13 +44,26 @@ public final class ClusterProbe {
 
     /** The Compose service currently leading, or empty if no member claims the role. */
     public Optional<String> leaderService() {
-        for (int i = 0; i < healthUrls.size(); i++) {
-            String metrics = fetch(healthUrls.get(i) + "/metrics");
+        for (String healthUrl : healthUrls) {
+            String metrics = fetch(healthUrl + "/metrics");
             if (metrics != null && metrics.contains("role=\"leader\"} 1")) {
-                return Optional.of(services.get(i));
+                return serviceOf(metrics);
             }
         }
         return Optional.empty();
+    }
+
+    /**
+     * The Compose service behind a metrics response, read from its {@code node} label. Member ids
+     * are {@code <cluster>-node-<ordinal>} and the ordinal indexes the service list.
+     */
+    private Optional<String> serviceOf(String metrics) {
+        Matcher matcher = NODE_LABEL.matcher(metrics);
+        if (!matcher.find()) {
+            return Optional.empty();
+        }
+        int ordinal = Integer.parseInt(matcher.group(1));
+        return ordinal < services.size() ? Optional.of(services.get(ordinal)) : Optional.empty();
     }
 
     /** Blocks until some member reports itself leader, or the deadline passes. */
@@ -58,14 +82,18 @@ public final class ClusterProbe {
     /** Every member's {@code applied} index, keyed by service, skipping unreachable members. */
     public Map<String, Long> appliedIndexes() {
         Map<String, Long> applied = new LinkedHashMap<>();
-        for (int i = 0; i < healthUrls.size(); i++) {
-            String metrics = fetch(healthUrls.get(i) + "/metrics");
+        for (String healthUrl : healthUrls) {
+            String metrics = fetch(healthUrl + "/metrics");
             if (metrics == null) {
+                continue;
+            }
+            Optional<String> service = serviceOf(metrics);
+            if (service.isEmpty()) {
                 continue;
             }
             for (String line : metrics.split("\n")) {
                 if (line.startsWith("ledgerkv_raft_applied_index")) {
-                    applied.put(services.get(i),
+                    applied.put(service.get(),
                             Long.parseLong(line.substring(line.lastIndexOf(' ') + 1).trim()));
                 }
             }

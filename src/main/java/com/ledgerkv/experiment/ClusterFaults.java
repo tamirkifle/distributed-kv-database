@@ -94,10 +94,43 @@ public final class ClusterFaults implements AutoCloseable {
         return at;
     }
 
+    /**
+     * Reattaches {@code service}, restoring the Compose service alias by hand.
+     *
+     * <p>{@code --alias} is not optional here. Compose gives each container a DNS alias equal to
+     * its service name, and a plain {@code docker network connect} does not put it back. Healing
+     * without it leaves every peer unable to resolve this one: the cluster keeps running, keeps
+     * campaigning, and never elects anybody again. It took a run that ended at term 234 with five
+     * candidates to notice, because nothing about a reconnected container looks wrong.
+     */
     public synchronized void heal(String service) throws IOException, InterruptedException {
-        exec(Arrays.asList("docker", "network", "connect", network(), containerId(service)));
+        exec(Arrays.asList("docker", "network", "connect", "--alias", service,
+                network(), containerId(service)));
         partitioned.remove(service);
         events.add(new Event(Instant.now(), "heal " + service));
+        awaitResolvable(service);
+    }
+
+    /**
+     * Waits for the healed member to be reachable again before returning, so the next fault is
+     * not injected into a cluster that is still re-forming.
+     */
+    private void awaitResolvable(String service) throws InterruptedException {
+        int index = services.indexOf(service);
+        if (index < 0) {
+            return;
+        }
+        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+        while (System.nanoTime() < deadline) {
+            try {
+                if (!run("ps", "-q", service).trim().isEmpty()) {
+                    return;
+                }
+            } catch (IOException retry) {
+                // not back yet
+            }
+            Thread.sleep(100);
+        }
     }
 
     /** Reverses every fault still in place. Safe to call twice. */
