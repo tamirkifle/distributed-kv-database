@@ -35,6 +35,11 @@ import java.util.TreeMap;
  * only by {@link #apply}, never by a read, and the snapshot preserves eviction order rather than
  * sorting it away. Every replica must run the same {@code maxSessions}: it is part of the
  * deterministic state machine, not a local tuning knob.
+ *
+ * <p>An evicted client is not detected. A command arriving with no session opens a new one, so a
+ * client evicted while still live can have a retry applied a second time. Closing that needs the
+ * RegisterClient RPC of §6.3, where the cluster allocates the session and "no record" therefore
+ * means "expired" rather than "new".
  */
 public final class RaftKvStateMachine implements StateMachine {
 
@@ -109,12 +114,18 @@ public final class RaftKvStateMachine implements StateMachine {
                 touch(cmd.clientId(), session);
                 return session.lastResult; // genuine retry: answer from the record
             }
-        } else if (cmd.sequenceNumber() != 1) {
-            // No session and not a first request. Either this client's session was evicted or it
-            // lost track of its own numbering; opening a session here would re-admit commands it
-            // may already have applied. Refuse and let it start over under a fresh id.
-            return EMPTY;
         } else {
+            // No session: open one at whatever sequence this client presents.
+            //
+            // Requiring a new session to start at sequence 1 looks like a way to tell a new client
+            // from one whose session was evicted. It is not, and it bricks clients: a client whose
+            // very first write is lost in flight moves on to sequence 2, which then has no session
+            // to attach to, and every write it ever makes afterwards is refused in silence.
+            //
+            // Ongaro §6.3 is clear the distinction cannot be drawn without a RegisterClient
+            // handshake, which LogCabin has and this does not. Given the choice between locking
+            // out live clients and re-admitting an evicted one, the eviction risk is the smaller
+            // harm: it takes more than maxSessions active clients before it can happen at all.
             session = new Session();
         }
 

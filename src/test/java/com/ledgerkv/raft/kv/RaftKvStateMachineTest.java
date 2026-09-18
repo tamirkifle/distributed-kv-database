@@ -93,16 +93,28 @@ class RaftKvStateMachineTest {
     }
 
     @Test
-    void anUnseenClientMayOnlyOpenASessionAtSequenceOne() {
+    void anUnseenClientOpensASessionAtWhateverSequenceItPresents() {
         RaftKvStateMachine sm = new RaftKvStateMachine();
-        // No session and no way to tell a new client from one whose session was evicted, so a
-        // mid-stream sequence is refused rather than admitted as a fresh client.
-        sm.apply(KvCommand.put("ghost", 7, "k", "v".getBytes()).encode());
-        assertNull(sm.get("k"));
-        assertEquals(0, sm.lastAppliedSequence("ghost"));
 
-        sm.apply(KvCommand.put("ghost", 1, "k", "v".getBytes()).encode());
+        sm.apply(KvCommand.put("ghost", 7, "k", "v".getBytes()).encode());
+
         assertArrayEquals("v".getBytes(), sm.get("k"));
+        assertEquals(7, sm.lastAppliedSequence("ghost"));
+    }
+
+    @Test
+    void aClientWhoseFirstWriteWasLostCanStillMakeProgress() {
+        // Requiring a new session to open at sequence 1 bricked exactly this client: its opening
+        // write never committed, so it moved on to sequence 2, which had no session to attach to,
+        // and every write it made from then on was refused without a word.
+        RaftKvStateMachine sm = new RaftKvStateMachine();
+
+        // sequence 1 is lost in flight and never applied; the client gives up and moves on
+        sm.apply(KvCommand.put("c", 2, "k", "v2".getBytes()).encode());
+        sm.apply(KvCommand.put("c", 3, "k", "v3".getBytes()).encode());
+
+        assertArrayEquals("v3".getBytes(), sm.get("k"));
+        assertEquals(3, sm.lastAppliedSequence("c"));
     }
 
     @Test
