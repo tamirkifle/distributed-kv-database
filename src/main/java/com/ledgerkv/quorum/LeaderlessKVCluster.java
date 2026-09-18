@@ -478,6 +478,7 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         int attemptedCount = toReplay.size();
         int appliedCount = 0;
         List<HintedHandoff> remainingHints = new ArrayList<>();
+        List<HintedHandoffReplayResult.Failure> failures = new ArrayList<>();
 
         for (HintedHandoff hint : toReplay) {
             ReplicaClient client = clientsByNodeId.get(hint.getTargetNodeId());
@@ -491,7 +492,12 @@ public final class LeaderlessKVCluster implements AutoCloseable {
                 client.deliverHint(hint.getKey(), new VersionedValue(
                     hint.getValue(), versionFor(hintMetadata), hintMetadata, hint.isDeleted()));
                 appliedCount++;
-            } catch (RuntimeException ignored) {
+            } catch (RuntimeException undelivered) {
+                // Keep the cause. A hint that fails because its replica is down and one that fails
+                // because this coordinator cannot make any call at all produce the same count, and
+                // discarding the exception is what makes the two indistinguishable after the fact.
+                failures.add(new HintedHandoffReplayResult.Failure(
+                    hint.getTargetNodeId(), hint.getKey(), undelivered));
                 remainingHints.add(hint);
             }
         }
@@ -505,7 +511,7 @@ public final class LeaderlessKVCluster implements AutoCloseable {
             pendingHints.addAll(remainingHints);
             outstanding = pendingHints.size();
         }
-        return new HintedHandoffReplayResult(attemptedCount, appliedCount, outstanding);
+        return new HintedHandoffReplayResult(attemptedCount, appliedCount, outstanding, failures);
     }
 
     public QuorumResponse read(int coordinatorIndex, String key) {

@@ -41,10 +41,23 @@ class RaftModeEndToEndTest {
     /**
      * Ports are picked by binding and releasing, because a Raft member has to publish its peer
      * address before its peers start. Port 0 resolves too late for that.
+     *
+     * <p>That leaves a window, and on a busy machine something else wins it: a run of this test
+     * once reached a member whose port had been taken by an unrelated HTTP server and got back
+     * {@code UNIMPLEMENTED: HTTP status code 404}. {@link Cluster#build} closes the window by
+     * checking every member is really ours and starting over if one is not.
      */
     private static int freePort() throws IOException {
         try (ServerSocket socket = new ServerSocket(0)) {
+            socket.setReuseAddress(true);
             return socket.getLocalPort();
+        }
+    }
+
+    /** Thrown when a port we reserved turns out to be serving something that is not LedgerKV. */
+    private static final class PortStolenException extends RuntimeException {
+        PortStolenException(String message) {
+            super(message);
         }
     }
 
@@ -105,6 +118,27 @@ class RaftModeEndToEndTest {
                 servers.add(server);
                 clients.add(NodeClient.connect("localhost", clientPorts.get(i)));
                 clientIndexById.put(config.nodeId(), i);
+            }
+        }
+
+        /**
+         * Confirms each published endpoint is one of our own servers. A foreign process on a
+         * reserved port answers a gRPC call with UNIMPLEMENTED or UNKNOWN; ours answers, or
+         * redirects because it is not the leader.
+         */
+        void verifyMembersAreOurs() {
+            for (int i = 0; i < clients.size(); i++) {
+                try {
+                    clients.get(i).getSiblings("__probe__");
+                } catch (NotLeaderException ours) {
+                    continue; // a follower redirecting is proof enough that it is ours
+                } catch (StatusRuntimeException e) {
+                    Status.Code code = e.getStatus().getCode();
+                    if (code == Status.Code.UNIMPLEMENTED || code == Status.Code.UNKNOWN) {
+                        throw new PortStolenException(
+                                endpoints.get(i) + " is not a LedgerKV node: " + e.getStatus());
+                    }
+                }
             }
         }
 
@@ -198,9 +232,29 @@ class RaftModeEndToEndTest {
         }
     }
 
+    /**
+     * Builds a cluster, retrying if a reserved port was taken by a foreign process. Three attempts
+     * because losing the race twice in a row is already implausible; losing it three times means
+     * something other than luck and the test should say so rather than hang.
+     */
+    private static Cluster build(Path root, int size) throws IOException {
+        PortStolenException last = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            Cluster cluster = new Cluster(root.resolve("attempt" + attempt), size);
+            try {
+                cluster.verifyMembersAreOurs();
+                return cluster;
+            } catch (PortStolenException stolen) {
+                last = stolen;
+                cluster.close();
+            }
+        }
+        throw new AssertionError("could not get a clean set of ports in three attempts", last);
+    }
+
     @Test
     void servesBinaryValuesAndDeletesThroughTheLeader(@TempDir Path root) throws Exception {
-        try (Cluster cluster = new Cluster(root, 3)) {
+        try (Cluster cluster = build(root, 3)) {
             NodeClient leader = cluster.awaitLeaderClient();
             byte[] binary = new byte[] {0, 1, 2, (byte) 0xff, 0, 'x'};
 
@@ -220,7 +274,7 @@ class RaftModeEndToEndTest {
 
     @Test
     void aFollowerRedirectsRatherThanServing(@TempDir Path root) throws Exception {
-        try (Cluster cluster = new Cluster(root, 3)) {
+        try (Cluster cluster = build(root, 3)) {
             NodeClient follower = cluster.anyFollowerClient();
 
             NotLeaderException redirect = assertThrows(NotLeaderException.class,
@@ -240,7 +294,7 @@ class RaftModeEndToEndTest {
 
     @Test
     void aRetriedMutationIsNotAppliedTwice(@TempDir Path root) throws Exception {
-        try (Cluster cluster = new Cluster(root, 3)) {
+        try (Cluster cluster = build(root, 3)) {
             NodeClient leader = cluster.awaitLeaderClient();
             leader.put("counter", "first".getBytes(UTF_8), MutationId.of("c1", 1));
 
@@ -255,7 +309,7 @@ class RaftModeEndToEndTest {
 
     @Test
     void reusingASequenceForADifferentValueIsRejected(@TempDir Path root) throws Exception {
-        try (Cluster cluster = new Cluster(root, 3)) {
+        try (Cluster cluster = build(root, 3)) {
             NodeClient leader = cluster.awaitLeaderClient();
             leader.put("k", "first".getBytes(UTF_8), MutationId.of("c1", 1));
 
@@ -270,7 +324,7 @@ class RaftModeEndToEndTest {
 
     @Test
     void aMutationWithoutAClientIdIsRefused(@TempDir Path root) throws Exception {
-        try (Cluster cluster = new Cluster(root, 3)) {
+        try (Cluster cluster = build(root, 3)) {
             NodeClient leader = cluster.awaitLeaderClient();
 
             StatusRuntimeException e = assertThrows(StatusRuntimeException.class,
@@ -284,7 +338,7 @@ class RaftModeEndToEndTest {
 
     @Test
     void scanReportsThatRaftModeCannotServeIt(@TempDir Path root) throws Exception {
-        try (Cluster cluster = new Cluster(root, 3)) {
+        try (Cluster cluster = build(root, 3)) {
             NodeClient leader = cluster.awaitLeaderClient();
 
             StatusRuntimeException e = assertThrows(StatusRuntimeException.class,
@@ -297,7 +351,7 @@ class RaftModeEndToEndTest {
 
     @Test
     void theClusterClientFindsTheLeaderFromAnyStartingPoint(@TempDir Path root) throws Exception {
-        try (Cluster cluster = new Cluster(root, 3)) {
+        try (Cluster cluster = build(root, 3)) {
             cluster.awaitLeaderClient(); // let the group settle before pointing a client at it
             try (LedgerKvClusterClient client = LedgerKvClusterClient.connect(
                     cluster.endpoints, "app-1", Duration.ofSeconds(10))) {
@@ -315,7 +369,7 @@ class RaftModeEndToEndTest {
 
     @Test
     void theClusterClientKeepsWritingAcrossALeaderLoss(@TempDir Path root) throws Exception {
-        try (Cluster cluster = new Cluster(root, 5)) {
+        try (Cluster cluster = build(root, 5)) {
             cluster.awaitLeaderClient();
             try (LedgerKvClusterClient client = LedgerKvClusterClient.connect(
                     cluster.endpoints, "app-1", Duration.ofSeconds(20))) {
@@ -336,7 +390,7 @@ class RaftModeEndToEndTest {
 
     @Test
     void aMinorityRefusesRatherThanServingStaleData(@TempDir Path root) throws Exception {
-        try (Cluster cluster = new Cluster(root, 5)) {
+        try (Cluster cluster = build(root, 5)) {
             cluster.awaitLeaderClient();
             try (LedgerKvClusterClient client = LedgerKvClusterClient.connect(
                     cluster.endpoints, "app-1", Duration.ofSeconds(10))) {

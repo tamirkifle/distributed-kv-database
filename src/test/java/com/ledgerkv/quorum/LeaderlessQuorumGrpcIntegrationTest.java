@@ -38,6 +38,10 @@ class LeaderlessQuorumGrpcIntegrationTest {
 
     @BeforeEach
     void setUp() throws Exception {
+        // Surefire runs every test class on one thread. A gRPC blocking stub turns an already-set
+        // interrupt flag into CANCELLED without sending anything, so a flag left behind by an
+        // earlier class would fail this one's RPCs for reasons that have nothing to do with it.
+        Thread.interrupted();
         membership = ClusterMembership.create("itest", 3, 3);
         for (int i = 0; i < membership.getNodes().size(); i++) {
             String nodeId = membership.getNodes().get(i).getId();
@@ -118,7 +122,10 @@ class LeaderlessQuorumGrpcIntegrationTest {
 
         partitions.get(nodeId(2)).setAvailable(true);
         HintedHandoffReplayResult afterHeal = cluster.replayPendingHints();
-        assertEquals(1, afterHeal.getAppliedCount());
+        // Name the cause. This assertion failed once in a full-suite run and reported only
+        // "expected: <1> but was: <0>", which says nothing about whether the replica refused, the
+        // call timed out, or the coordinator could not make a call at all.
+        assertEquals(1, afterHeal.getAppliedCount(), () -> afterHeal.describeFailures());
         assertEquals(0, afterHeal.getRemainingCount());
 
         assertEquals("v", cluster.getReplicaValue(nodeId(2), "k").orElseThrow().getValue());
