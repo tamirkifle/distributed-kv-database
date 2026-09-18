@@ -38,38 +38,49 @@ mkdir -p "$OUT"
 git diff HEAD > "$OUT/working-tree.patch"
 
 echo "==> artifacts: $OUT"
-echo "==> starting a clean 5-node Raft cluster"
-docker compose -f "$COMPOSE" down -v >/dev/null 2>&1 || true
-docker compose -f "$COMPOSE" up -d --build >"$OUT/compose-up.log" 2>&1
 
-echo "==> waiting for a leader"
-for _ in $(seq 1 60); do
-  if curl -fsS --max-time 2 http://localhost:8180/metrics 2>/dev/null | grep -q 'role="leader"} 1' \
-  || curl -fsS --max-time 2 http://localhost:8181/metrics 2>/dev/null | grep -q 'role="leader"} 1' \
-  || curl -fsS --max-time 2 http://localhost:8182/metrics 2>/dev/null | grep -q 'role="leader"} 1' \
-  || curl -fsS --max-time 2 http://localhost:8183/metrics 2>/dev/null | grep -q 'role="leader"} 1' \
-  || curl -fsS --max-time 2 http://localhost:8184/metrics 2>/dev/null | grep -q 'role="leader"} 1'; then
-    break
-  fi
-  sleep 2
-done
+# Each experiment gets a brand-new cluster, volumes included.
+#
+# Not tidiness. Repeated partitions leave members that have been detached and reattached to the
+# Compose network, and a cluster in that state takes far longer to re-form than a fresh one --
+# long enough that the next experiment measures the previous experiment's damage. Starting clean
+# also guarantees an empty keyspace, so no history can read a value an earlier run wrote.
+fresh_cluster() {
+  docker compose -f "$COMPOSE" down -v >/dev/null 2>&1 || true
+  docker compose -f "$COMPOSE" up -d >>"$OUT/compose-up.log" 2>&1
+  for _ in $(seq 1 90); do
+    for port in 8180 8181 8182 8183 8184; do
+      if curl -fsS --max-time 2 "http://localhost:$port/metrics" 2>/dev/null \
+          | grep -q 'role="leader"} 1'; then
+        return 0
+      fi
+    done
+    sleep 2
+  done
+  echo "no leader after 180s" >&2
+  return 1
+}
+
+echo "==> building the image"
+docker compose -f "$COMPOSE" build >"$OUT/compose-up.log" 2>&1
 
 status=0
 for scenario in healthy leader_loss partition_3_2; do
   echo "==> exp-01 $scenario ($HISTORIES histories)"
+  fresh_cluster || { status=1; continue; }
   java -cp "$JAR" com.ledgerkv.experiment.CorrectnessExperiment \
     --histories "$HISTORIES" --seed 1 --scenario "$scenario" --compose "$COMPOSE" \
     >"$OUT/exp01-$scenario.txt" 2>&1 || status=1
   tail -4 "$OUT/exp01-$scenario.txt"
+  docker compose -f "$COMPOSE" logs --no-color >"$OUT/cluster-$scenario.log" 2>&1 || true
 done
 
 echo "==> exp-02 failover ($CYCLES cycles)"
+fresh_cluster || status=1
 java -cp "$JAR" com.ledgerkv.experiment.FailoverExperiment \
   --cycles "$CYCLES" --compose "$COMPOSE" >"$OUT/exp02-failover.txt" 2>&1 || status=1
 tail -8 "$OUT/exp02-failover.txt"
-
-echo "==> collecting container logs"
-docker compose -f "$COMPOSE" logs --no-color >"$OUT/cluster.log" 2>&1 || true
+docker compose -f "$COMPOSE" logs --no-color >"$OUT/cluster-exp02.log" 2>&1 || true
 
 echo "==> tearing the cluster down"
 docker compose -f "$COMPOSE" down -v >/dev/null 2>&1 || true
