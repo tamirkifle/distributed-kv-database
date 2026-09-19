@@ -123,7 +123,11 @@ public final class RaftClientCoordinator implements ClientCoordinator {
             throw new IllegalStateException("interrupted awaiting commit of " + command, e);
         } catch (ProposalRejectedException rejected) {
             metrics.recordOperation(false, false, millisSince(start));
-            throw notLeader(); // nothing was appended, so the write definitely did not happen
+            // Nothing was appended, so the write definitely did not happen. Chain the cause: the
+            // redirect says where to go next, the cause says what this node actually refused.
+            NotLeaderException redirect = notLeader();
+            redirect.initCause(rejected);
+            throw redirect;
         } catch (IllegalStateException timedOut) {
             metrics.recordOperation(false, false, millisSince(start));
             // The entry is in the log and may still commit. Surfacing this as a redirect would

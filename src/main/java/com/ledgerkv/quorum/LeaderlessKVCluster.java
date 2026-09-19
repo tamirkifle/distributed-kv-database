@@ -308,6 +308,9 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         int completed = 0;
         int submitted = replicas.size();
         long hedgeAtNanos = startNanos + hedgingDelay.toNanos();
+        // What each replica threw, so a failure is attributed to its real cause rather
+        // than to a blanket "node unavailable".
+        Map<String, RuntimeException> observedFailures = new LinkedHashMap<>();
         try {
             // Return as soon as the quorum is satisfied. Continuing to wait after W acks were
             // already durable held the client behind a slow minority for no benefit.
@@ -346,6 +349,8 @@ public final class LeaderlessKVCluster implements AutoCloseable {
                         primaryAcks++;
                     }
                     failureContext.responded(result.nodeId);
+                } else if (!result.ok && result.nodeId != null) {
+                    observedFailures.put(result.nodeId, result.cause);
                 }
             }
         } catch (RuntimeException e) {
@@ -359,7 +364,10 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         // task below keeps waiting and only files a hint for the ones that never arrive.
         for (ClusterNode replica : replicas) {
             if (!acked.contains(replica.getId())) {
-                failureContext.failed(replica.getId(), FailureCause.UNAVAILABLE_NODE);
+                // A replica that threw is reported with what it threw; one that never answered
+                // inside the deadline has no cause to report and stays UNAVAILABLE_NODE.
+                failureContext.failed(replica.getId(),
+                    causeOf(observedFailures.get(replica.getId())));
             }
         }
 
@@ -540,6 +548,9 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         int hedgesFired = 0;
         int submitted = replicas.size();
         long hedgeAtNanos = startNanos + hedgingDelay.toNanos();
+        // What each replica threw, so a failure is attributed to its real cause rather
+        // than to a blanket "node unavailable".
+        Map<String, RuntimeException> observedFailures = new LinkedHashMap<>();
         try {
             // Block only until R replicas have RESPONDED (or the deadline). The threshold counts
             // responders, not values: since replicas hold sibling sets, one replica returning two
@@ -578,6 +589,8 @@ public final class LeaderlessKVCluster implements AutoCloseable {
                         primaryResponses++;
                     }
                     failureContext.responded(result.nodeId);
+                } else if (result.nodeId != null) {
+                    observedFailures.put(result.nodeId, result.cause);
                 }
             }
         } finally {
@@ -588,7 +601,8 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         // Hedge targets are not primaries, so they are not marked failed.
         for (ClusterNode replica : replicas) {
             if (!responded.contains(replica.getId())) {
-                failureContext.failed(replica.getId(), FailureCause.UNAVAILABLE_NODE);
+                failureContext.failed(replica.getId(),
+                    causeOf(observedFailures.get(replica.getId())));
             }
         }
 
@@ -621,7 +635,7 @@ public final class LeaderlessKVCluster implements AutoCloseable {
                 try {
                     return ReplicaResult.ok(nodeId, clientsByNodeId.get(nodeId).get(key));
                 } catch (RuntimeException e) {
-                    return ReplicaResult.failed(nodeId);
+                    return ReplicaResult.failed(nodeId, e);
                 }
             }));
         }
@@ -646,7 +660,7 @@ public final class LeaderlessKVCluster implements AutoCloseable {
                     currentByNode.put(result.nodeId, result.values);
                     failureContext.responded(result.nodeId);
                 } else {
-                    failureContext.failed(result.nodeId, FailureCause.UNAVAILABLE_NODE);
+                    failureContext.failed(result.nodeId, causeOf(result.cause));
                 }
             }
         } finally {
@@ -756,7 +770,7 @@ public final class LeaderlessKVCluster implements AutoCloseable {
                 clientsByNodeId.get(nodeId).put(key, value);
                 return ReplicaResult.written(nodeId);
             } catch (RuntimeException e) {
-                return ReplicaResult.failed(nodeId);
+                return ReplicaResult.failed(nodeId, e);
             }
         });
     }
@@ -768,7 +782,7 @@ public final class LeaderlessKVCluster implements AutoCloseable {
             try {
                 return ReplicaResult.ok(nodeId, clientsByNodeId.get(nodeId).get(key));
             } catch (RuntimeException e) {
-                return ReplicaResult.failed(nodeId);
+                return ReplicaResult.failed(nodeId, e);
             }
         });
     }
@@ -794,7 +808,9 @@ public final class LeaderlessKVCluster implements AutoCloseable {
             Thread.currentThread().interrupt();
             return null;
         } catch (java.util.concurrent.ExecutionException e) {
-            return ReplicaResult.failed(null); // defensive: a task escaped its own catch
+            // Defensive: a task escaped its own catch. Keep the cause; this one signals a bug.
+            return ReplicaResult.failed(null,
+                e.getCause() instanceof RuntimeException ? (RuntimeException) e.getCause() : null);
         }
     }
 
@@ -919,23 +935,55 @@ public final class LeaderlessKVCluster implements AutoCloseable {
         final String nodeId;
         final boolean ok;
         final List<VersionedValue> values;
+        /** What the replica call threw, or null when it simply never answered. */
+        final RuntimeException cause;
 
-        private ReplicaResult(String nodeId, boolean ok, List<VersionedValue> values) {
+        private ReplicaResult(String nodeId, boolean ok, List<VersionedValue> values,
+                RuntimeException cause) {
             this.nodeId = nodeId;
             this.ok = ok;
             this.values = values;
+            this.cause = cause;
         }
 
         static ReplicaResult ok(String nodeId, List<VersionedValue> values) {
-            return new ReplicaResult(nodeId, true, values);
+            return new ReplicaResult(nodeId, true, values, null);
         }
 
         static ReplicaResult written(String nodeId) {
-            return new ReplicaResult(nodeId, true, List.of());
+            return new ReplicaResult(nodeId, true, List.of(), null);
         }
 
-        static ReplicaResult failed(String nodeId) {
-            return new ReplicaResult(nodeId, false, List.of());
+        static ReplicaResult failed(String nodeId, RuntimeException cause) {
+            return new ReplicaResult(nodeId, false, List.of(), cause);
         }
+    }
+
+    /**
+     * Classifies what a replica call threw. Reporting every failure as {@code UNAVAILABLE_NODE}
+     * regardless of cause made {@link FailureContext#getFailureCauses()} decorative, and worse,
+     * untrue: a coordinator that cannot make any call at all would blame all N replicas for being
+     * down. A null cause means no answer arrived before the deadline, which genuinely is a node
+     * that did not respond.
+     */
+    private static FailureCause causeOf(RuntimeException thrown) {
+        if (thrown == null) {
+            return FailureCause.UNAVAILABLE_NODE;
+        }
+        if (thrown instanceof io.grpc.StatusRuntimeException) {
+            io.grpc.Status.Code code = ((io.grpc.StatusRuntimeException) thrown).getStatus().getCode();
+            if (code == io.grpc.Status.Code.DEADLINE_EXCEEDED
+                    || code == io.grpc.Status.Code.CANCELLED) {
+                return FailureCause.DROPPED_MESSAGE;
+            }
+            if (code == io.grpc.Status.Code.UNAVAILABLE) {
+                return FailureCause.UNAVAILABLE_NODE;
+            }
+            return FailureCause.UNKNOWN;
+        }
+        if (thrown instanceof IllegalStateException) {
+            return FailureCause.UNAVAILABLE_NODE; // a replica that refused the call outright
+        }
+        return FailureCause.UNKNOWN;
     }
 }

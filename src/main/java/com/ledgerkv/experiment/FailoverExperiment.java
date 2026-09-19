@@ -48,6 +48,7 @@ public final class FailoverExperiment {
         Set<String> acknowledged = new LinkedHashSet<>();
         Set<String> unknown = new LinkedHashSet<>();
         int lost = 0;
+        int unchecked = 0;
 
         System.out.println("exp-02 cycles=" + settings.cycles);
         try (LedgerKvClusterClient client = LedgerKvClusterClient.connect(
@@ -76,16 +77,24 @@ public final class FailoverExperiment {
                         1, settings.services.size(), RECOVERY_LIMIT);
                 caughtUp.ifPresent(d -> catchUpMillis.add(d.toMillis()));
 
-                int missing = countMissing(client, acknowledged);
-                lost += missing;
-                System.out.printf("  cycle %-3d killed=%-6s outage=%5d ms catchUp=%s lost=%d%n",
+                Audit audit = auditAcknowledged(client, acknowledged);
+                lost += audit.missing;
+                unchecked += audit.unchecked;
+                System.out.printf(
+                        "  cycle %-3d killed=%-6s outage=%5d ms catchUp=%s lost=%d unchecked=%d%n",
                         cycle, leader, outage,
-                        caughtUp.map(d -> d.toMillis() + " ms").orElse("timeout"), missing);
+                        caughtUp.map(d -> d.toMillis() + " ms").orElse("timeout"),
+                        audit.missing, audit.unchecked);
             }
 
             System.out.println();
             System.out.println("acknowledged=" + acknowledged.size()
-                    + " unknownOutcome=" + unknown.size() + " lost=" + lost);
+                    + " unknownOutcome=" + unknown.size() + " lost=" + lost
+                    + " uncheckable=" + unchecked);
+            if (unchecked > 0) {
+                System.out.println("warning: " + unchecked + " key checks could not be completed,"
+                        + " so lost=" + lost + " is a lower bound rather than a result.");
+            }
             report("write outage", outagesMillis);
             report("follower catch-up", catchUpMillis);
             if (!unknown.isEmpty()) {
@@ -128,19 +137,39 @@ public final class FailoverExperiment {
                 "no write succeeded within " + RECOVERY_LIMIT + " of the kill at " + killedAt);
     }
 
-    /** How many acknowledged keys the cluster can no longer produce. */
-    private static int countMissing(LedgerKvClusterClient client, Set<String> acknowledged) {
+    /**
+     * Checks every acknowledged key is still readable.
+     *
+     * <p>Counts the keys it could not check separately, and that separation is the point. A key
+     * whose read throws has not been shown to survive; folding those into "not missing" makes
+     * {@code lost=0} come out true even in a run where nothing could be read at all, which is the
+     * most flattering possible way for this measurement to be wrong.
+     */
+    private static Audit auditAcknowledged(
+            LedgerKvClusterClient client, Set<String> acknowledged) {
         int missing = 0;
+        int unchecked = 0;
         for (String key : acknowledged) {
             try {
                 if (client.get(key).isEmpty()) {
                     missing++;
                 }
             } catch (RuntimeException unreadable) {
-                // Could not check this key right now; do not score it either way.
+                unchecked++;
             }
         }
-        return missing;
+        return new Audit(missing, unchecked);
+    }
+
+    /** Keys confirmed gone, and keys that could not be confirmed either way. */
+    private static final class Audit {
+        final int missing;
+        final int unchecked;
+
+        Audit(int missing, int unchecked) {
+            this.missing = missing;
+            this.unchecked = unchecked;
+        }
     }
 
     private static void report(String label, List<Long> samples) {

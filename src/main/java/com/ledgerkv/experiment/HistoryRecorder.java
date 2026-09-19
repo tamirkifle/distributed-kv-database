@@ -34,6 +34,8 @@ public final class HistoryRecorder {
     private static final QuorumConfig RAFT_PLACEHOLDER = new QuorumConfig(3, 2, 2);
 
     private final List<OperationRecord> operations = new ArrayList<>();
+    private final List<String> readFailures =
+            java.util.Collections.synchronizedList(new ArrayList<>());
     private final int coordinator;
 
     public HistoryRecorder() {
@@ -55,9 +57,18 @@ public final class HistoryRecorder {
             append(OperationType.READ, key, observed, start, OperationResult.SUCCESS);
             return observed;
         } catch (Exception e) {
+            // The read constrains nothing either way, but keep why it failed: a run where every
+            // read failed because the client could not reach anyone looks identical, in the
+            // counts alone, to one where the cluster simply had no leader for a while.
+            readFailures.add(key + ": " + e);
             append(OperationType.READ, key, null, start, OperationResult.FAILURE);
             return null;
         }
+    }
+
+    /** Why each failed read failed, in the order they were recorded. */
+    public synchronized List<String> readFailures() {
+        return new ArrayList<>(readFailures);
     }
 
     /** Runs a write and records it, classifying anything it threw. */
